@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import * as XLSX from "xlsx";
-// BUILD: 2026_03_26_build0001
+// BUILD: 2026_03_26_build0002
 // ============================================================
 // POZNÁMKY PRO CLAUDE (čti na začátku každé session)
 // ============================================================
@@ -46,11 +46,12 @@ import * as XLSX from "xlsx";
 // HISTORY BUILDŮ
 // ============================================================
 // BUILD0001 — Etapa 1: základ, auth, objekty, byty, nájemníci, log, záloha, XLSX
+// BUILD0002 — Záložka Platby: generování předpisů, zaplaceno/saldo. Fix: type=date
 //
 // ============================================================
 // SUPABASE CONFIG
 // ============================================================
-const APP_BUILD = "build0001";
+const APP_BUILD = "build0002";
 
 const SB_URL = import.meta.env.VITE_SB_URL;
 const SB_KEY = import.meta.env.VITE_SB_KEY;
@@ -124,7 +125,13 @@ export default function App() {
   const [objekty, setObjekty] = useState([]);
   const [byty, setByty] = useState([]);
   const [najemnici, setNajemnici] = useState([]);
+  const [platby, setPlatby] = useState([]);
   const [logData, setLogData] = useState([]);
+
+  // Platby - aktuální měsíc/rok
+  const now = new Date();
+  const [platbyMesic, setPlatbyMesic] = useState(now.getMonth());
+  const [platbyRok, setPlatbyRok] = useState(now.getFullYear());
 
   // UI stavy
   const [filterObjekt, setFilterObjekt] = useState("");
@@ -234,6 +241,12 @@ export default function App() {
     }
   }, [session, userRole]);
 
+  useEffect(() => {
+    if (session && userRole && activeTab === "platby") {
+      loadPlatby(platbyMesic, platbyRok);
+    }
+  }, [session, userRole, activeTab, platbyMesic, platbyRok]);
+
   const loadAll = async () => {
     try {
       const [obj, byt, naj] = await Promise.all([
@@ -246,6 +259,15 @@ export default function App() {
       setNajemnici(naj || []);
     } catch (e) {
       showMsg("Chyba načítání dat: " + e.message, "err");
+    }
+  };
+
+  const loadPlatby = async (mesic, rok) => {
+    try {
+      const res = await sb(`platby?rok=eq.${rok}&mesic=eq.${mesic + 1}&order=byt_id.asc`);
+      setPlatby(res || []);
+    } catch (e) {
+      showMsg("Chyba načítání plateb: " + e.message, "err");
     }
   };
 
@@ -353,6 +375,52 @@ export default function App() {
       await loadAll();
       setDeleteConfirm(null);
     } catch (e) { showMsg("Chyba: " + e.message, "err"); }
+  };
+
+  // ── PLATBY CRUD ────────────────────────────────────────────
+  const generujPredpisy = async () => {
+    const obsazene = byty.filter(b => b.stav === "obsazený" && b.najem_kc);
+    if (obsazene.length === 0) { showMsg("Žádné obsazené byty s nájmem.", "err"); return; }
+    const mesicDB = platbyMesic + 1;
+    let pridano = 0, preskoceno = 0;
+    for (const b of obsazene) {
+      const existuje = platby.find(p => p.byt_id === b.id && p.mesic === mesicDB && p.rok === platbyRok);
+      if (existuje) { preskoceno++; continue; }
+      const predpis = (Number(b.najem_kc) || 0) + (Number(b.zalohy_kc) || 0);
+      await sb("platby", { method: "POST", body: JSON.stringify({
+        byt_id: b.id, rok: platbyRok, mesic: mesicDB,
+        predpis_kc: predpis, zaplaceno: false,
+      }), prefer: "return=minimal" });
+      pridano++;
+    }
+    await logAkce(userName, "Generování předpisů", `${mesicDB}/${platbyRok}: ${pridano} nových, ${preskoceno} přeskočeno`);
+    showMsg(`Předpisy vygenerovány: ${pridano} nových${preskoceno ? `, ${preskoceno} již existovalo` : ""}`);
+    await loadPlatby(platbyMesic, platbyRok);
+  };
+
+  const toggleZaplaceno = async (platba, checked) => {
+    const dnes = new Date().toISOString().slice(0, 10);
+    const payload = {
+      zaplaceno: checked,
+      castka_kc: checked ? platba.predpis_kc : null,
+      datum_platby: checked ? dnes : null,
+    };
+    await sb(`platby?id=eq.${platba.id}`, { method: "PATCH", body: JSON.stringify(payload), prefer: "return=minimal" });
+    await logAkce(userName, checked ? "Platba zaplacena" : "Platba zrušena", `ID platby: ${platba.id}, byt_id: ${platba.byt_id}`);
+    await loadPlatby(platbyMesic, platbyRok);
+  };
+
+  const updateCastkaPlatby = async (platba, castka) => {
+    await sb(`platby?id=eq.${platba.id}`, { method: "PATCH", body: JSON.stringify({ castka_kc: castka ? Number(castka) : null }), prefer: "return=minimal" });
+    await loadPlatby(platbyMesic, platbyRok);
+  };
+
+  const deletePlatba = async (id) => {
+    await sb(`platby?id=eq.${id}`, { method: "DELETE", prefer: "return=minimal" });
+    await logAkce(userName, "Smazání platby", `ID: ${id}`);
+    showMsg("Platba smazána");
+    await loadPlatby(platbyMesic, platbyRok);
+    setDeleteConfirm(null);
   };
 
   // ── LOG ────────────────────────────────────────────────────
@@ -473,6 +541,14 @@ export default function App() {
     return { celkem: byty.length, obsazeno, prijemMesic, brzeKonec };
   }, [byty, najemnici]);
 
+  const platbyStats = useMemo(() => {
+    const predpis = platby.reduce((s, p) => s + (Number(p.predpis_kc) || 0), 0);
+    const zaplaceno = platby.filter(p => p.zaplaceno).reduce((s, p) => s + (Number(p.castka_kc) || Number(p.predpis_kc) || 0), 0);
+    const dluh = predpis - zaplaceno;
+    const pocetNezapl = platby.filter(p => !p.zaplaceno).length;
+    return { predpis, zaplaceno, dluh, pocetNezapl };
+  }, [platby]);
+
   const isSmlouvaBrzy = (datum) => {
     if (!datum) return false;
     const diff = (new Date(datum) - new Date()) / (1000 * 60 * 60 * 24);
@@ -555,7 +631,7 @@ export default function App() {
           🏠 <span style={{ color: "#3b82f6" }}>Podnájem</span>
         </div>
         {/* TABS */}
-        {["prehled", "najemnici", "objekty"].map(tab => (
+        {["prehled", "platby", "najemnici", "objekty"].map(tab => (
           <button key={tab} onClick={() => setActiveTab(tab)} style={{
             padding: "0 16px", height: 52, border: "none", background: "none",
             fontSize: 13, color: activeTab === tab ? "#3b82f6" : muted,
@@ -563,7 +639,7 @@ export default function App() {
             cursor: "pointer", fontWeight: activeTab === tab ? 600 : 400,
             fontFamily: "inherit",
           }}>
-            {tab === "prehled" ? "Přehled" : tab === "najemnici" ? "Nájemníci" : "Objekty a byty"}
+            {tab === "prehled" ? "Přehled" : tab === "platby" ? "Platby" : tab === "najemnici" ? "Nájemníci" : "Objekty a byty"}
           </button>
         ))}
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
@@ -678,6 +754,101 @@ export default function App() {
                                 <button onClick={() => setBytForm({ ...b })} style={{ background: "none", border: "none", cursor: "pointer", color: muted, fontSize: 14, padding: "2px 4px" }} title="Editovat">✏️</button>
                                 <button onClick={() => setDeleteConfirm({ type: "byt", id: b.id, nazev: b.cislo_bytu })} style={{ background: "none", border: "none", cursor: "pointer", color: "#f87171", fontSize: 14, padding: "2px 4px" }} title="Smazat">🗑️</button>
                               </div>
+                            </td>
+                          )}
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* TAB: PLATBY */}
+        {activeTab === "platby" && (
+          <div>
+            {/* Měsíc navigace */}
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 18, flexWrap: "wrap" }}>
+              <button onClick={() => { let m = platbyMesic - 1, r = platbyRok; if (m < 0) { m = 11; r--; } setPlatbyMesic(m); setPlatbyRok(r); }} style={{ ...btnSecondary, padding: "6px 12px", fontSize: 14 }}>‹</button>
+              <span style={{ fontSize: 15, fontWeight: 600, minWidth: 130, textAlign: "center" }}>
+                {["Leden","Únor","Březen","Duben","Květen","Červen","Červenec","Srpen","Září","Říjen","Listopad","Prosinec"][platbyMesic]} {platbyRok}
+              </span>
+              <button onClick={() => { let m = platbyMesic + 1, r = platbyRok; if (m > 11) { m = 0; r++; } setPlatbyMesic(m); setPlatbyRok(r); }} style={{ ...btnSecondary, padding: "6px 12px", fontSize: 14 }}>›</button>
+              {isAdmin && (
+                <button onClick={generujPredpisy} style={{ ...btnPrimary, marginLeft: 8 }}>
+                  + Generovat předpisy
+                </button>
+              )}
+              <span style={{ fontSize: 12, color: muted }}>
+                {platby.length > 0 ? `${platby.length} předpisů` : "Žádné předpisy — klikněte Generovat"}
+              </span>
+            </div>
+
+            {/* Saldo karty */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 14, marginBottom: 20 }}>
+              {[
+                { label: "Předpis celkem", value: platbyStats.predpis ? fmt(platbyStats.predpis) + " Kč" : "—", color: "#3b82f6" },
+                { label: "Zaplaceno", value: platbyStats.zaplaceno ? fmt(platbyStats.zaplaceno) + " Kč" : "—", color: "#22c55e" },
+                { label: "Dluh", value: platbyStats.dluh > 0 ? fmt(platbyStats.dluh) + " Kč" : "0 Kč", color: platbyStats.dluh > 0 ? "#f87171" : "#22c55e" },
+              ].map(c => (
+                <div key={c.label} style={{ ...cardSx, textAlign: "center" }}>
+                  <div style={{ fontSize: 12, color: muted, marginBottom: 8 }}>{c.label}</div>
+                  <div style={{ fontSize: 22, fontWeight: 700, color: c.color }}>{c.value}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Tabulka plateb */}
+            <div style={{ ...cardSx, padding: 0, overflow: "hidden" }}>
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                  <thead>
+                    <tr style={{ background: isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.03)" }}>
+                      {["Dům", "Byt", "Nájemník", "Předpis", "Zaplaceno", "Datum platby", "Stav", "Zapl.?", isAdmin ? "Akce" : ""].filter(Boolean).map(h => (
+                        <th key={h} style={{ padding: "10px 14px", textAlign: "left", color: muted, fontWeight: 600, fontSize: 11, borderBottom: `1px solid ${border}`, whiteSpace: "nowrap" }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {platby.length === 0 && (
+                      <tr><td colSpan={9} style={{ padding: "40px", textAlign: "center", color: muted }}>
+                        Žádné předpisy pro tento měsíc.{isAdmin && " Klikněte \"+ Generovat předpisy\"."}
+                      </td></tr>
+                    )}
+                    {platby.map(p => {
+                      const byt = byty.find(b => b.id === p.byt_id);
+                      const obj = byt ? objekty.find(o => o.id === byt.objekt_id) : null;
+                      const naj = najemnici.find(n => n.byt_id === p.byt_id);
+                      return (
+                        <tr key={p.id} style={{ borderBottom: `1px solid ${border}`, background: p.zaplaceno ? (isDark ? "rgba(34,197,94,0.04)" : "rgba(34,197,94,0.03)") : "transparent" }}
+                          onMouseEnter={e => e.currentTarget.style.background = isDark ? "rgba(255,255,255,0.02)" : "rgba(0,0,0,0.02)"}
+                          onMouseLeave={e => e.currentTarget.style.background = p.zaplaceno ? (isDark ? "rgba(34,197,94,0.04)" : "rgba(34,197,94,0.03)") : "transparent"}>
+                          <td style={{ padding: "10px 14px", color: muted, fontSize: 12 }}>{obj?.nazev || "—"}</td>
+                          <td style={{ padding: "10px 14px", fontWeight: 600 }}>{byt?.cislo_bytu || "—"}</td>
+                          <td style={{ padding: "10px 14px" }}>{naj?.jmeno || <span style={{ color: muted }}>—</span>}</td>
+                          <td style={{ padding: "10px 14px", fontWeight: 500 }}>{p.predpis_kc ? fmt(p.predpis_kc) + " Kč" : "—"}</td>
+                          <td style={{ padding: "10px 14px", color: p.zaplaceno ? "#4ade80" : muted }}>
+                            {p.zaplaceno ? (fmt(p.castka_kc || p.predpis_kc) + " Kč") : "—"}
+                          </td>
+                          <td style={{ padding: "10px 14px", color: muted, fontSize: 12 }}>{p.datum_platby || "—"}</td>
+                          <td style={{ padding: "10px 14px" }}>
+                            <span style={{ padding: "2px 10px", borderRadius: 99, fontSize: 11, fontWeight: 500, background: p.zaplaceno ? "rgba(34,197,94,0.15)" : "rgba(239,68,68,0.12)", color: p.zaplaceno ? "#4ade80" : "#f87171" }}>
+                              {p.zaplaceno ? "zaplaceno" : "nezaplaceno"}
+                            </span>
+                          </td>
+                          <td style={{ padding: "10px 14px" }}>
+                            {isAdmin && (
+                              <input type="checkbox" checked={p.zaplaceno || false}
+                                onChange={e => toggleZaplaceno(p, e.target.checked)}
+                                style={{ width: 16, height: 16, cursor: "pointer", accentColor: "#22c55e" }} />
+                            )}
+                          </td>
+                          {isAdmin && (
+                            <td style={{ padding: "10px 14px" }}>
+                              <button onClick={() => setDeleteConfirm({ type: "platba", id: p.id, nazev: `předpis byt ${byt?.cislo_bytu}` })}
+                                style={{ background: "none", border: "none", cursor: "pointer", color: "#f87171", fontSize: 14 }}>🗑️</button>
                             </td>
                           )}
                         </tr>
@@ -883,6 +1054,7 @@ export default function App() {
                 if (deleteConfirm.type === "objekt") deleteObjekt(deleteConfirm.id);
                 else if (deleteConfirm.type === "byt") deleteByt(deleteConfirm.id);
                 else if (deleteConfirm.type === "najemnik") deleteNajemnik(deleteConfirm.id);
+                else if (deleteConfirm.type === "platba") deletePlatba(deleteConfirm.id);
               }} style={{ flex: 1, ...btnDanger, fontWeight: 700 }}>Smazat</button>
             </div>
           </div>
@@ -1112,11 +1284,11 @@ function FormNajemnik({ data, onChange, onSave, onCancel, byty, objekty, inputSx
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
         <div>
           <label style={{ fontSize: 12, color: muted, display: "block", marginBottom: 5 }}>Smlouva od</label>
-          <input style={inputSx} value={data.smlouva_od || ""} onChange={e => onChange({ ...data, smlouva_od: e.target.value })} placeholder="2024-01-01" />
+          <input style={inputSx} type="date" value={data.smlouva_od || ""} onChange={e => onChange({ ...data, smlouva_od: e.target.value })} />
         </div>
         <div>
           <label style={{ fontSize: 12, color: muted, display: "block", marginBottom: 5 }}>Smlouva do</label>
-          <input style={inputSx} value={data.smlouva_do || ""} onChange={e => onChange({ ...data, smlouva_do: e.target.value })} placeholder="2025-12-31" />
+          <input style={inputSx} type="date" value={data.smlouva_do || ""} onChange={e => onChange({ ...data, smlouva_do: e.target.value })} />
         </div>
         <div>
           <label style={{ fontSize: 12, color: muted, display: "block", marginBottom: 5 }}>Kauce (Kč)</label>
