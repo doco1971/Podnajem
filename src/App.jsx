@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from "react";
 import * as XLSX from "xlsx";
-// BUILD: 2026_03_28_build0004
+// BUILD: 2026_03_28_build0005
 // ============================================================
 // PRAVIDLO #0 — PŘED KAŽDÝM ROZŠÍŘENÍM: průzkum → výběr → implementace
 // PRAVIDLO #1 — NEFUNGUJE: zkontroluj kód. NEHÁDEJ.
@@ -43,9 +43,12 @@ import * as XLSX from "xlsx";
 // BUILD0003 — Flexibilní položky zálohy, pohled období, upozornění smluv
 // BUILD0004 — Přepracovaná architektura: jednotky, smlouvy, sazebník, dodatky
 //             Formát datumů dd.mm.yyyy, type=date všude
+// BUILD0005 — FIX refresh plateb po generování, platební formulář automaticky
+//             načte položky ze sazebníku, správná struktura platby (příjem/odečet/info),
+//             roční vyúčtování (formulář + detail smlouvy), úhrady jako variabilní pole
 //
 // ============================================================
-const APP_BUILD = "build0004";
+const APP_BUILD = "build0005";
 const SB_URL = import.meta.env.VITE_SB_URL;
 const SB_KEY = import.meta.env.VITE_SB_KEY;
 const MESICE = ["Leden","Únor","Březen","Duben","Květen","Červen","Červenec","Srpen","Září","Říjen","Listopad","Prosinec"];
@@ -130,6 +133,7 @@ export default function App() {
   const [sazebnikPolozky, setSazebnikPolozky] = useState([]);
   const [platby, setPlatby] = useState([]);
   const [platbyPolozky, setPlatbyPolozky] = useState([]);
+  const [vyuctovani, setVyuctovani] = useState([]);
   const [logData, setLogData] = useState([]);
 
   // Platby stav
@@ -138,6 +142,7 @@ export default function App() {
   const [platbyRok, setPlatbyRok] = useState(now.getFullYear());
   const [platbySmlouva, setPlatbySmlouva] = useState("");
   const [platbyPohled, setPlatbyPohled] = useState("mesic");
+  const [platbyRefresh, setPlatbyRefresh] = useState(0);
 
   // UI
   const [filterObjekt, setFilterObjekt] = useState("");
@@ -154,6 +159,7 @@ export default function App() {
   const [dodatekForm, setDodatekForm] = useState(null);
   const [sazebnikForm, setSazebnikForm] = useState(null);
   const [editPlatba, setEditPlatba] = useState(null);
+  const [vyuctovaniForm, setVyuctovaniForm] = useState(null);
   const [deleteConfirm, setDeleteConfirm] = useState(null);
   const [detailSmlouva, setDetailSmlouva] = useState(null);
 
@@ -219,7 +225,7 @@ export default function App() {
 
   useEffect(() => {
     if (session && userRole && activeTab === "platby") loadPlatby();
-  }, [session, userRole, activeTab, platbyMesic, platbyRok, platbySmlouva, platbyPohled]);
+  }, [session, userRole, activeTab, platbyMesic, platbyRok, platbySmlouva, platbyPohled, platbyRefresh]);
 
   const loadAll = async () => {
     try {
@@ -257,6 +263,14 @@ export default function App() {
         const pp = await sb(`platby_polozky?platba_id=in.(${ids})&order=platba_id.asc`);
         setPlatbyPolozky(pp || []);
       } else { setPlatbyPolozky([]); }
+      // Načíst vyúčtování pro vybranou smlouvu
+      if (platbySmlouva) {
+        const vyuct = await sb(`vyuctovani?smlouva_id=eq.${platbySmlouva}&order=datum.desc`);
+        setVyuctovani(vyuct || []);
+      } else {
+        const vyuct = await sb("vyuctovani?order=datum.desc&limit=50");
+        setVyuctovani(vyuct || []);
+      }
     } catch (e) { showMsg("Chyba plateb: " + e.message, "err"); }
   };
 
@@ -508,7 +522,7 @@ export default function App() {
     }
     await logAkce(userName, "Generování předpisů", `${mesicDB}/${platbyRok}: ${pridano} nových`);
     showMsg(`Vygenerováno: ${pridano} nových${preskoceno ? `, ${preskoceno} přeskočeno` : ""}`);
-    await loadPlatby();
+    setPlatbyRefresh(r => r + 1);
   };
 
   const savePlatba = async (data) => {
@@ -529,14 +543,38 @@ export default function App() {
         }
       }
       showMsg("Platba uložena"); await logAkce(userName, "Editace platby", `ID: ${data.id}`);
-      await loadPlatby(); setEditPlatba(null);
+      setPlatbyRefresh(r => r + 1); setEditPlatba(null);
     } catch (e) { showMsg("Chyba: " + e.message, "err"); }
   };
 
   const deletePlatba = async (id) => {
     try {
       await sb(`platby?id=eq.${id}`, { method: "DELETE", prefer: "return=minimal" });
-      showMsg("Platba smazána"); await loadPlatby(); setDeleteConfirm(null);
+      showMsg("Platba smazána"); setPlatbyRefresh(r => r + 1); setDeleteConfirm(null);
+    } catch (e) { showMsg("Chyba: " + e.message, "err"); }
+  };
+
+  // ── CRUD — Vyúčtování ─────────────────────────────────────
+  const saveVyuctovani = async (data) => {
+    try {
+      const payload = {
+        smlouva_id: Number(data.smlouva_id),
+        datum: toISO(data.datum),
+        typ: data.typ || "nedoplatek",
+        castka_kc: Number(data.castka_kc) || 0,
+        popis: data.popis || "",
+        uhrazeno: data.uhrazeno || false,
+        datum_uhrazeni: data.uhrazeno ? toISO(data.datum_uhrazeni) || null : null,
+      };
+      if (data.id) {
+        await sb(`vyuctovani?id=eq.${data.id}`, { method: "PATCH", body: JSON.stringify(payload), prefer: "return=minimal" });
+      } else {
+        await sb("vyuctovani", { method: "POST", body: JSON.stringify(payload) });
+      }
+      await logAkce(userName, "Vyúčtování", `smlouva_id: ${data.smlouva_id}, ${data.typ}: ${data.castka_kc} Kč`);
+      showMsg("Vyúčtování uloženo");
+      setPlatbyRefresh(r => r + 1);
+      setVyuctovaniForm(null);
     } catch (e) { showMsg("Chyba: " + e.message, "err"); }
   };
 
@@ -698,6 +736,7 @@ export default function App() {
                 <span style={{ fontSize: 14, fontWeight: 600, minWidth: 130, textAlign: "center" }}>{MESICE[platbyMesic]} {platbyRok}</span>
                 <button onClick={() => { let m = platbyMesic+1, r = platbyRok; if(m>11){m=0;r++;} setPlatbyMesic(m); setPlatbyRok(r); }} style={{ ...S.btnS, padding: "6px 12px", fontSize: 14 }}>›</button>
                 {isAdmin && <button onClick={generujPredpisy} style={S.btnP}>+ Generovat předpisy</button>}
+                {isAdmin && platbySmlouva && <button onClick={() => setVyuctovaniForm({ smlouva_id: platbySmlouva, datum: new Date().toISOString().slice(0,10), typ: "nedoplatek", uhrazeno: false })} style={{ ...S.btnS, fontSize: 12 }}>+ Vyúčtování</button>}
               </>}
             </div>
 
@@ -759,7 +798,20 @@ export default function App() {
                           <td style={{ ...S.td, color: muted, fontSize: 12 }}>{fmtDate(p.datum_platby)}</td>
                           <td style={S.td}><span style={{ padding: "2px 10px", borderRadius: 99, fontSize: 11, fontWeight: 500, background: p.zaplaceno ? "rgba(34,197,94,0.15)" : "rgba(239,68,68,0.12)", color: p.zaplaceno ? "#4ade80" : "#f87171" }}>{p.zaplaceno ? "zaplaceno" : "nezaplaceno"}</span>{p.poznamka && <div style={{ fontSize: 11, color: muted, marginTop: 2 }}>{p.poznamka}</div>}</td>
                           {isAdmin && <td style={S.td}>
-                            <button onClick={() => setEditPlatba({ ...p, polozky: pp.map(x => ({...x})) })} style={{ background: "none", border: "none", cursor: "pointer", color: muted, fontSize: 14 }}>✏️</button>
+                            <button onClick={() => {
+                              const pp = platbyPolozky.filter(x => x.platba_id === p.id);
+                              // Pokud platba nemá položky, načti ze sazebníku
+                              let polozkyData = pp.map(x => ({...x}));
+                              if (polozkyData.length === 0 && p.smlouva_id) {
+                                const saz = sazebnikKDatu(p.smlouva_id, p.rok, p.mesic);
+                                if (saz) {
+                                  polozkyData = sazebnikPolozky
+                                    .filter(sp => sp.sazebnik_id === saz.id)
+                                    .map(sp => ({ nazev: sp.nazev, castka_predpis_kc: sp.castka_kc, typ: sp.typ, _fromSazebnik: true }));
+                                }
+                              }
+                              setEditPlatba({ ...p, polozky: polozkyData });
+                            }} style={{ background: "none", border: "none", cursor: "pointer", color: muted, fontSize: 14 }}>✏️</button>
                             <button onClick={() => setDeleteConfirm({ type: "platba", id: p.id, nazev: `platba ${MESICE[p.mesic-1]} ${p.rok}` })} style={{ background: "none", border: "none", cursor: "pointer", color: "#f87171", fontSize: 14 }}>🗑️</button>
                           </td>}
                         </tr>
@@ -769,10 +821,55 @@ export default function App() {
                 </table>
               </div>
             </div>
+
+            {/* Vyúčtování energií */}
+            {vyuctovani.length > 0 && (
+              <div style={{ marginTop: 20 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                  <span style={{ fontWeight: 600, fontSize: 14 }}>Roční vyúčtování energií</span>
+                  {isAdmin && platbySmlouva && <button onClick={() => setVyuctovaniForm({ smlouva_id: platbySmlouva, datum: new Date().toISOString().slice(0,10), typ: "nedoplatek", uhrazeno: false })} style={{ ...S.btnS, fontSize: 12 }}>+ Přidat vyúčtování</button>}
+                </div>
+                <div style={{ ...S.card, padding: 0, overflow: "hidden" }}>
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                      <thead>
+                        <tr style={{ background: isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.03)" }}>
+                          {["Datum","Typ","Popis","Částka","Uhrazeno","Datum úhrady",isAdmin?"Akce":""].filter(Boolean).map(h => <th key={h} style={S.th}>{h}</th>)}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {vyuctovani.map(v => {
+                          const sml = smlouvy.find(s => s.id === v.smlouva_id);
+                          const naj = sml ? najemnici.find(n => n.id === sml.najemnik_id) : null;
+                          return (
+                            <tr key={v.id} style={{ borderBottom: `1px solid ${border}` }}>
+                              <td style={{ ...S.td, color: muted }}>{fmtDate(v.datum)}</td>
+                              <td style={S.td}><span style={{ padding: "2px 8px", borderRadius: 99, fontSize: 11, fontWeight: 500, background: v.typ === "nedoplatek" ? "rgba(239,68,68,0.12)" : "rgba(34,197,94,0.12)", color: v.typ === "nedoplatek" ? "#f87171" : "#4ade80" }}>{v.typ}</span></td>
+                              <td style={S.td}>{v.popis || <span style={{ color: muted }}>—</span>}{naj && <div style={{ fontSize: 11, color: muted }}>{naj.jmeno}</div>}</td>
+                              <td style={{ ...S.td, fontWeight: 600, color: v.typ === "nedoplatek" ? "#f87171" : "#4ade80" }}>{fmtKc(v.castka_kc)}</td>
+                              <td style={S.td}><span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, background: v.uhrazeno ? "rgba(34,197,94,0.12)" : "rgba(239,68,68,0.08)", color: v.uhrazeno ? "#4ade80" : "#f87171" }}>{v.uhrazeno ? "✓ ano" : "✗ ne"}</span></td>
+                              <td style={{ ...S.td, color: muted }}>{fmtDate(v.datum_uhrazeni)}</td>
+                              {isAdmin && <td style={S.td}>
+                                <button onClick={() => setVyuctovaniForm({ ...v })} style={{ background: "none", border: "none", cursor: "pointer", color: muted, fontSize: 13 }}>✏️</button>
+                              </td>}
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Tlačítko vyúčtování když je vybrána smlouva ale žádné vyúčtování ještě není */}
+            {isAdmin && platbySmlouva && vyuctovani.length === 0 && (
+              <div style={{ marginTop: 16, textAlign: "center" }}>
+                <button onClick={() => setVyuctovaniForm({ smlouva_id: platbySmlouva, datum: new Date().toISOString().slice(0,10), typ: "nedoplatek", uhrazeno: false })} style={{ ...S.btnS, fontSize: 12 }}>+ Přidat roční vyúčtování energií</button>
+              </div>
+            )}
           </div>
         )}
-
-        {/* ── SMLOUVY ── */}
         {activeTab === "smlouvy" && (
           <div>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
@@ -954,6 +1051,7 @@ export default function App() {
         const jList = jIds.map(jid => jednotky.find(j => j.id === jid)).filter(Boolean);
         const smlDodatky = dodatky.filter(d => d.smlouva_id === s.id).sort((a,b) => b.datum.localeCompare(a.datum));
         const smlSazebnik = sazebnik.filter(sz => sz.smlouva_id === s.id).sort((a,b) => b.platne_od.localeCompare(a.platne_od));
+        const smlVyuctovani = vyuctovani.filter(v => v.smlouva_id === s.id).sort((a,b) => b.datum.localeCompare(a.datum));
         return (
           <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 2000, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "inherit" }}>
             <div style={{ background: surface, borderRadius: 16, width: "min(800px,96vw)", maxHeight: "90vh", overflow: "auto", border: `1px solid ${border}` }}>
@@ -1000,9 +1098,23 @@ export default function App() {
                     </div>
                   ))}
                 </div>
+                {/* Vyúčtování v detailu smlouvy */}
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8, color: text }}>Roční vyúčtování</div>
+                  {smlVyuctovani.length === 0 ? <div style={{ color: muted, fontSize: 13 }}>Žádné vyúčtování.</div> : smlVyuctovani.map(v => (
+                    <div key={v.id} style={{ display: "flex", gap: 12, padding: "8px 0", borderBottom: `0.5px solid ${border}`, fontSize: 13, alignItems: "center" }}>
+                      <span style={{ color: muted, minWidth: 90 }}>{fmtDate(v.datum)}</span>
+                      <span style={{ padding: "1px 8px", borderRadius: 99, fontSize: 11, background: v.typ === "nedoplatek" ? "rgba(239,68,68,0.12)" : "rgba(34,197,94,0.12)", color: v.typ === "nedoplatek" ? "#f87171" : "#4ade80" }}>{v.typ}</span>
+                      <span style={{ fontWeight: 600, color: v.typ === "nedoplatek" ? "#f87171" : "#4ade80" }}>{fmtKc(v.castka_kc)}</span>
+                      {v.popis && <span style={{ color: muted }}>{v.popis}</span>}
+                      <span style={{ fontSize: 11, padding: "1px 6px", borderRadius: 99, background: v.uhrazeno ? "rgba(34,197,94,0.1)" : "rgba(255,255,255,0.05)", color: v.uhrazeno ? "#4ade80" : muted }}>{v.uhrazeno ? "uhrazeno" : "neuhrazeno"}</span>
+                    </div>
+                  ))}
+                </div>
                 {isAdmin && <div style={{ display: "flex", gap: 10 }}>
                   <button onClick={() => { setDetailSmlouva(null); setDodatekForm({ smlouva_id: s.id, datum: new Date().toISOString().slice(0,10), typ: "prodloužení" }); }} style={S.btnS}>+ Dodatek</button>
                   <button onClick={() => { const saz = aktualniSazebnik(s.id); setDetailSmlouva(null); setSazebnikForm({ smlouva_id: s.id, platne_od: new Date().toISOString().slice(0,10), polozky: saz ? sazebnikPolozky.filter(sp => sp.sazebnik_id === saz.id).map(sp => ({...sp})) : [{ nazev: "Nájem čistý", castka_kc: 0, typ: "najem" }] }); }} style={S.btnS}>+ Sazebník</button>
+                  <button onClick={() => { setDetailSmlouva(null); setVyuctovaniForm({ smlouva_id: s.id, datum: new Date().toISOString().slice(0,10), typ: "nedoplatek", uhrazeno: false }); }} style={S.btnS}>+ Vyúčtování</button>
                 </div>}
               </div>
             </div>
@@ -1030,6 +1142,11 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* VYÚČTOVÁNÍ FORM */}
+      {vyuctovaniForm && <Modal title={vyuctovaniForm.id ? "Editace vyúčtování" : "Nové vyúčtování"} onClose={() => setVyuctovaniForm(null)} surface={surface} border={border} text={text}>
+        <FormVyuctovani data={vyuctovaniForm} onChange={setVyuctovaniForm} onSave={saveVyuctovani} onCancel={() => setVyuctovaniForm(null)} S={S} muted={muted} text={text} />
+      </Modal>}
 
       {/* LOG */}
       {showLog && (
@@ -1289,6 +1406,30 @@ function FormPlatba({ data, onChange, onSave, onCancel, S, muted, text, border, 
     </div>
     <FormRow label="Poznámka" muted={muted}><textarea style={{...S.input,resize:"vertical",minHeight:60}} value={data.poznamka||""} onChange={e=>onChange({...data,poznamka:e.target.value})} /></FormRow>
     <div style={{display:"flex",gap:10}}><button onClick={onCancel} style={{flex:1,...S.btnS}}>Zrušit</button><button onClick={()=>onSave(data)} style={{flex:1,...S.btnP}}>Uložit platbu</button></div>
+  </div>;
+}
+
+function FormVyuctovani({ data, onChange, onSave, onCancel, S, muted, text }) {
+  return <div style={{display:"flex",flexDirection:"column",gap:14}}>
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+      <FormRow label="Datum" muted={muted}><input style={S.input} type="date" value={data.datum||""} onChange={e=>onChange({...data,datum:e.target.value})} /></FormRow>
+      <FormRow label="Typ" muted={muted}>
+        <select style={S.input} value={data.typ||"nedoplatek"} onChange={e=>onChange({...data,typ:e.target.value})}>
+          <option value="nedoplatek">Nedoplatek</option>
+          <option value="přeplatek">Přeplatek</option>
+        </select>
+      </FormRow>
+      <FormRow label="Částka (Kč)" muted={muted}><input style={S.input} type="number" value={data.castka_kc||""} onChange={e=>onChange({...data,castka_kc:e.target.value})} placeholder="0" /></FormRow>
+      <FormRow label="Popis" muted={muted}><input style={S.input} value={data.popis||""} onChange={e=>onChange({...data,popis:e.target.value})} placeholder="např. Eon 2024" /></FormRow>
+    </div>
+    <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",fontSize:13,color:text}}>
+      <input type="checkbox" checked={data.uhrazeno||false} onChange={e=>onChange({...data,uhrazeno:e.target.checked})} /> Uhrazeno
+    </label>
+    {data.uhrazeno && <FormRow label="Datum úhrady" muted={muted}><input style={S.input} type="date" value={data.datum_uhrazeni||""} onChange={e=>onChange({...data,datum_uhrazeni:e.target.value})} /></FormRow>}
+    <div style={{display:"flex",gap:10,marginTop:8}}>
+      <button onClick={onCancel} style={{flex:1,...S.btnS}}>Zrušit</button>
+      <button onClick={()=>onSave(data)} disabled={!data.datum||!data.castka_kc} style={{flex:1,...S.btnP,opacity:(data.datum&&data.castka_kc)?1:0.5}}>Uložit</button>
+    </div>
   </div>;
 }
 
