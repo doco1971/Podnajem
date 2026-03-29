@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from "react";
 import * as XLSX from "xlsx";
-// BUILD: 2026_03_29_build0007
+// BUILD: 2026_03_29_build0008
 // ============================================================
 // PRAVIDLO #0 — PŘED KAŽDÝM ROZŠÍŘENÍM: průzkum → výběr → implementace
 // PRAVIDLO #1 — NEFUNGUJE: zkontroluj kód. NEHÁDEJ.
@@ -50,15 +50,19 @@ import * as XLSX from "xlsx";
 //             FIX: saveVyuctovani guard pro undefined smlouva_id
 //             FIX: castka_skutecnost_kc sloupec neexistuje → odstraněn z INSERT
 // BUILD0007 — FIX: generování předpisů kontroluje datum_od/datum_do smlouvy
-//             FIX: formulář platby — vždy jasně oddělený předpis vs. platba
-//             NEW: nápověda — tlačítko ? s popisem každé záložky
-//             NEW: checklist měsíčního uzávěrku v záložce Platby
-//             NEW: roční přehled plateb (tabulka jako Excel, řádky=nájemníci, sloupce=měsíce)
-//             NEW: kdo nezaplatil — červený přehled na záložce Přehled
-//             NEW: celkové saldo smlouvy v detailu smlouvy
+//             NEW: nápověda, checklist, roční přehled, kdo nezaplatil, saldo smlouvy
+// BUILD0008 — FIX: saldo v detailu smlouvy načítá data vždy z DB (ne jen ze state)
+//             FIX: duplikáty sazebníků — kontrola při ukládání, nabídne přepsání
+//             FIX: Příjem/měsíc — opravený výpočet (příjmy minus odečty)
+//             NEW: kontrola starých předpisů mimo dobu smlouvy + tlačítko Zkontrolovat
+//             NEW: varování při generování pokud existují vadné předpisy
+//             NEW: vykřičník ! v ročním přehledu — klik otevře formulář + dogenerovat rok
+//             NEW: sklep — přepínač "Součást pronájmu bytu" (soucast_bytu)
+//             NEW: nápověda rozšířena: ⚠️ ⏰ ! ✗ tooltips na klíčových prvcích
+//             NEW: tooltip (title) na klíčových prvcích při najetí myší
 //
 // ============================================================
-const APP_BUILD = "build0007";
+const APP_BUILD = "build0008";
 const SB_URL = import.meta.env.VITE_SB_URL;
 const SB_KEY = import.meta.env.VITE_SB_KEY;
 const MESICE = ["Leden","Únor","Březen","Duben","Květen","Červen","Červenec","Srpen","Září","Říjen","Listopad","Prosinec"];
@@ -172,6 +176,10 @@ export default function App() {
   const [vyuctovaniForm, setVyuctovaniForm] = useState(null);
   const [deleteConfirm, setDeleteConfirm] = useState(null);
   const [detailSmlouva, setDetailSmlouva] = useState(null);
+  const [detailSmlPlatby, setDetailSmlPlatby] = useState([]); // platby načtené pro detail smlouvy
+  const [detailSmlPolozky, setDetailSmlPolozky] = useState([]);
+  const [detailSmlLoading, setDetailSmlLoading] = useState(false);
+  const [kontrolaPredpisuVysledek, setKontrolaPredpisuVysledek] = useState(null); // {vadne: [], ok}
   const [showHelp, setShowHelp] = useState(false);
   const [platbyPohled2, setPlatbyPohled2] = useState("mesic"); // "mesic" | "rok" | "nezaplaceno"
   const [rocniPlatby, setRocniPlatby] = useState([]);
@@ -330,20 +338,18 @@ export default function App() {
 
   const stats = useMemo(() => {
     const obsazeno = jednotky.filter(j => j.stav === "obsazený").length;
-    const prijemMesic = sazebnikPolozky
-      .filter(sp => {
-        const saz = sazebnik.find(s => s.id === sp.sazebnik_id);
-        if (!saz) return false;
-        const sm = aktivniSmlouvy.find(s => s.id === saz.smlouva_id);
-        return !!sm;
-      })
-      .reduce((sum, sp) => {
-        const saz = sazebnik.find(s => s.id === sp.sazebnik_id);
-        const sm = saz ? aktivniSmlouvy.find(s => s.id === saz.smlouva_id) : null;
-        if (!sm) return sum;
-        const akt = aktualniSazebnik(sm.id);
-        return akt?.id === sp.sazebnik_id ? sum + (Number(sp.castka_kc) || 0) : sum;
-      }, 0);
+    // FIX build0008: příjem = součet aktivních sazebníků, odečty se odečítají
+    const prijemMesic = sazebnikPolozky.reduce((sum, sp) => {
+      const saz = sazebnik.find(s => s.id === sp.sazebnik_id);
+      if (!saz) return sum;
+      const sm = aktivniSmlouvy.find(s => s.id === saz.smlouva_id);
+      if (!sm) return sum;
+      const akt = aktualniSazebnik(sm.id);
+      if (akt?.id !== sp.sazebnik_id) return sum;
+      const castka = Number(sp.castka_kc) || 0;
+      if (sp.typ === "odečet") return sum - castka;
+      return sum + castka;
+    }, 0);
     return { celkem: jednotky.length, obsazeno, prijemMesic, upozorneni: upozorneni.length };
   }, [jednotky, sazebnikPolozky, sazebnik, aktivniSmlouvy, upozorneni]);
 
@@ -381,6 +387,7 @@ export default function App() {
         dispozice: data.dispozice, plocha_m2: data.plocha_m2 ? Number(data.plocha_m2) : null,
         lodzie_m2: data.lodzie_m2 ? Number(data.lodzie_m2) : null,
         stav: data.stav || "volná", poznamka: data.poznamka,
+        soucast_bytu: data.typ === "sklep" ? (data.soucast_bytu !== false) : null,
       };
       if (data.id) { await sb(`jednotky?id=eq.${data.id}`, { method: "PATCH", body: JSON.stringify(payload), prefer: "return=minimal" }); showMsg("Jednotka uložena"); }
       else { await sb("jednotky", { method: "POST", body: JSON.stringify(payload) }); showMsg("Jednotka přidána"); }
@@ -496,8 +503,18 @@ export default function App() {
       if (data.id) {
         await sb(`sazebnik?id=eq.${data.id}`, { method: "PATCH", body: JSON.stringify(payload), prefer: "return=minimal" });
       } else {
-        const [nova] = await sb("sazebnik", { method: "POST", body: JSON.stringify(payload) });
-        sazId = nova.id;
+        // FIX build0008: kontrola duplikátu — stejná smlouva + stejné datum
+        const existujici = sazebnik.filter(s => s.smlouva_id === Number(data.smlouva_id) && s.platne_od === toISO(data.platne_od));
+        if (existujici.length > 0) {
+          const potvrdit = window.confirm(`Sazebník platný od ${data.platne_od} pro tuto smlouvu již existuje. Přepsat existující?`);
+          if (!potvrdit) return;
+          // Přepsat první nalezený
+          sazId = existujici[0].id;
+          await sb(`sazebnik?id=eq.${sazId}`, { method: "PATCH", body: JSON.stringify(payload), prefer: "return=minimal" });
+        } else {
+          const [nova] = await sb("sazebnik", { method: "POST", body: JSON.stringify(payload) });
+          sazId = nova.id;
+        }
       }
       // Uložit položky
       await sb(`sazebnik_polozky?sazebnik_id=eq.${sazId}`, { method: "DELETE", prefer: "return=minimal" });
@@ -548,6 +565,8 @@ export default function App() {
     if (mimoDobu) msg2.push(`${mimoDobu} mimo dobu smlouvy (přeskočeno)`);
     showMsg(msg2.join(", "));
     setPlatbyRefresh(r => r + 1);
+    // Automaticky zkontroluj vadné předpisy po generování
+    await kontrolaPredpisu();
   };
 
   const savePlatba = async (data) => {
@@ -634,6 +653,84 @@ export default function App() {
     } catch (e) { showMsg("Chyba ročního přehledu: " + e.message, "err"); }
     finally { setRocniLoading(false); }
   };
+
+  // Načte platby pro detail smlouvy vždy čerstvě z DB (FIX build0008)
+  const loadDetailSmlPlatby = async (smlouvaId) => {
+    setDetailSmlLoading(true);
+    try {
+      const pData = await sb(`platby?smlouva_id=eq.${smlouvaId}&order=rok.asc,mesic.asc`);
+      setDetailSmlPlatby(pData || []);
+      if (pData?.length > 0) {
+        const ids = pData.map(p => p.id).join(",");
+        const pp = await sb(`platby_polozky?platba_id=in.(${ids})`);
+        setDetailSmlPolozky(pp || []);
+      } else { setDetailSmlPolozky([]); }
+    } catch (e) { showMsg("Chyba načítání plateb: " + e.message, "err"); }
+    finally { setDetailSmlLoading(false); }
+  };
+
+  // Kontrola vadných předpisů — předpisy mimo dobu smlouvy
+  const kontrolaPredpisu = async () => {
+    try {
+      const vsechnyPlatby = await sb("platby?order=rok.asc,mesic.asc");
+      const vadne = vsechnyPlatby.filter(p => {
+        const sml = smlouvy.find(s => s.id === p.smlouva_id);
+        if (!sml) return true; // bez smlouvy = vadné
+        const smlOd = sml.datum_od || "0000-01-01";
+        const smlDo = sml.datum_do || "9999-12-31";
+        const mStart = `${p.rok}-${String(p.mesic).padStart(2,"0")}-01`;
+        const mKonec = `${p.rok}-${String(p.mesic).padStart(2,"0")}-${new Date(p.rok, p.mesic, 0).getDate()}`;
+        return mKonec < smlOd || mStart > smlDo;
+      });
+      setKontrolaPredpisuVysledek({ vadne, celkem: vsechnyPlatby.length });
+    } catch (e) { showMsg("Chyba kontroly: " + e.message, "err"); }
+  };
+
+  const smazVadnePredpisy = async (vadne) => {
+    try {
+      for (const p of vadne) {
+        await sb(`platby_polozky?platba_id=eq.${p.id}`, { method: "DELETE", prefer: "return=minimal" });
+        await sb(`platby?id=eq.${p.id}`, { method: "DELETE", prefer: "return=minimal" });
+      }
+      await logAkce(userName, "Smazání vadných předpisů", `${vadne.length} záznamů`);
+      showMsg(`Smazáno ${vadne.length} vadných předpisů`);
+      setKontrolaPredpisuVysledek(null);
+      setPlatbyRefresh(r => r + 1);
+    } catch (e) { showMsg("Chyba mazání: " + e.message, "err"); }
+  };
+
+  // Dogenerování předpisů pro celý rok (pro ! buňky v ročním přehledu)
+  const dogenerujRok = async (rok) => {
+    let pridano = 0;
+    for (const smlouva of aktivniSmlouvy) {
+      const smlOd = smlouva.datum_od || "0000-01-01";
+      const smlDo = smlouva.datum_do || "9999-12-31";
+      const jIds = smlouvaJednotky[smlouva.id] || [];
+      for (let mesic = 1; mesic <= 12; mesic++) {
+        const mStart = `${rok}-${String(mesic).padStart(2,"0")}-01`;
+        const mKonec = `${rok}-${String(mesic).padStart(2,"0")}-${new Date(rok, mesic, 0).getDate()}`;
+        if (mKonec < smlOd || mStart > smlDo) continue;
+        for (const jid of jIds) {
+          const existuje = rocniPlatby.find(p => p.smlouva_id === smlouva.id && p.jednotka_id === jid && p.mesic === mesic && p.rok === rok);
+          if (existuje) continue;
+          const saz = sazebnikKDatu(smlouva.id, rok, mesic);
+          const [nova] = await sb("platby", { method: "POST", body: JSON.stringify({ smlouva_id: smlouva.id, jednotka_id: jid, rok, mesic, zaplaceno: false }) });
+          if (saz && nova) {
+            const polozky = sazebnikPolozky.filter(sp => sp.sazebnik_id === saz.id);
+            if (polozky.length > 0) {
+              const ppRows = polozky.map(sp => ({ platba_id: nova.id, nazev: sp.nazev, castka_predpis_kc: sp.castka_kc }));
+              await sb("platby_polozky", { method: "POST", body: JSON.stringify(ppRows), prefer: "return=minimal" });
+            }
+          }
+          pridano++;
+        }
+      }
+    }
+    showMsg(`Dogenerováno ${pridano} předpisů pro rok ${rok}`);
+    await logAkce(userName, "Dogenerování roku", `${rok}: ${pridano} předpisů`);
+    await loadRocniPrehled(rok);
+  };
+
   const loadLog = async () => {
     try { const res = await sb("log_aktivit?order=cas.desc&limit=300&hidden=eq.false"); setLogData(res || []); } catch { setLogData([]); }
   };
@@ -677,6 +774,12 @@ export default function App() {
     logAkce(userName, "Export XLSX", `${rows.length} jednotek`);
     showMsg("XLSX exportováno");
   };
+
+  // FIX build0008: načti platby pro detail smlouvy vždy při otevření
+  useEffect(() => {
+    if (detailSmlouva) loadDetailSmlPlatby(detailSmlouva);
+    else { setDetailSmlPlatby([]); setDetailSmlPolozky([]); }
+  }, [detailSmlouva]);
 
   // ── Styly ─────────────────────────────────────────────────
   const bg = isDark ? "#0f172a" : "#f1f5f9";
@@ -744,12 +847,12 @@ export default function App() {
           <div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 14, marginBottom: 24 }}>
               {[
-                { label: "Jednotek celkem", value: stats.celkem, color: "#3b82f6" },
-                { label: "Obsazeno", value: stats.obsazeno, color: "#22c55e" },
-                { label: "Příjem / měsíc", value: stats.prijemMesic ? fmt(stats.prijemMesic) + " Kč" : "—", color: "#f59e0b" },
-                { label: "Pozor — smlouvy", value: stats.upozorneni, color: stats.upozorneni > 0 ? "#f87171" : "#22c55e" },
+                { label: "Jednotek celkem", value: stats.celkem, color: "#3b82f6", tip: "Celkový počet jednotek (byty, garáže, sklepy, stání)" },
+                { label: "Obsazeno", value: stats.obsazeno, color: "#22c55e", tip: "Počet obsazených jednotek s aktivní smlouvou" },
+                { label: "Příjem / měsíc", value: stats.prijemMesic ? fmt(stats.prijemMesic) + " Kč" : "—", color: "#f59e0b", tip: "Součet plateb ze sazebníků aktivních smluv (příjmy mínus odečty). Nemusí odpovídat skutečným platbám." },
+                { label: "Pozor — smlouvy", value: stats.upozorneni, color: stats.upozorneni > 0 ? "#f87171" : "#22c55e", tip: "Počet smluv které propadly nebo končí do 60 dní. Klikni na záložku Smlouvy pro detail." },
               ].map(c => (
-                <div key={c.label} style={{ ...S.card, textAlign: "center" }}>
+                <div key={c.label} style={{ ...S.card, textAlign: "center", cursor: "help" }} title={c.tip}>
                   <div style={{ fontSize: 12, color: muted, marginBottom: 8 }}>{c.label}</div>
                   <div style={{ fontSize: 26, fontWeight: 700, color: c.color }}>{c.value}</div>
                 </div>
@@ -812,17 +915,19 @@ export default function App() {
                   {aktivniSmlouvy.map(s => { const n = najemnici.find(x => x.id === s.najemnik_id); return <option key={s.id} value={s.id}>{n?.jmeno || "?"} — od {fmtDate(s.datum_od)}</option>; })}
                 </select>
                 {platbyPohled === "mesic" && <>
-                  <button onClick={() => { let m = platbyMesic-1, r = platbyRok; if(m<0){m=11;r--;} setPlatbyMesic(m); setPlatbyRok(r); }} style={{ ...S.btnS, padding: "6px 12px", fontSize: 14 }}>‹</button>
+                  <button onClick={() => { let m = platbyMesic-1, r = platbyRok; if(m<0){m=11;r--;} setPlatbyMesic(m); setPlatbyRok(r); }} style={{ ...S.btnS, padding: "6px 12px", fontSize: 14 }} title="Předchozí měsíc">‹</button>
                   <span style={{ fontSize: 14, fontWeight: 600, minWidth: 130, textAlign: "center" }}>{MESICE[platbyMesic]} {platbyRok}</span>
-                  <button onClick={() => { let m = platbyMesic+1, r = platbyRok; if(m>11){m=0;r++;} setPlatbyMesic(m); setPlatbyRok(r); }} style={{ ...S.btnS, padding: "6px 12px", fontSize: 14 }}>›</button>
-                  {isAdmin && <button onClick={generujPredpisy} style={S.btnP}>+ Generovat předpisy</button>}
+                  <button onClick={() => { let m = platbyMesic+1, r = platbyRok; if(m>11){m=0;r++;} setPlatbyMesic(m); setPlatbyRok(r); }} style={{ ...S.btnS, padding: "6px 12px", fontSize: 14 }} title="Následující měsíc">›</button>
+                  {isAdmin && <button onClick={generujPredpisy} style={S.btnP} title="Vygenerovat předpisy pro tento měsíc ze sazebníků">+ Generovat předpisy</button>}
+                  {isAdmin && <button onClick={kontrolaPredpisu} style={{ ...S.btnS, fontSize: 12 }} title="Zkontroluje zda v DB nejsou předpisy mimo dobu platnosti smluv">🔍 Zkontrolovat předpisy</button>}
                   {isAdmin && platbySmlouva && <button onClick={() => setVyuctovaniForm({ smlouva_id: platbySmlouva, datum: new Date().toISOString().slice(0,10), typ: "nedoplatek", uhrazeno: false })} style={{ ...S.btnS, fontSize: 12 }}>+ Vyúčtování</button>}
                 </>}
               </>}
               {platbyPohled2 === "rok" && <>
-                <button onClick={() => { const r = rocniRok-1; setRocniRok(r); loadRocniPrehled(r); }} style={{ ...S.btnS, padding: "6px 12px", fontSize: 14 }}>‹</button>
+                <button onClick={() => { const r = rocniRok-1; setRocniRok(r); loadRocniPrehled(r); }} style={{ ...S.btnS, padding: "6px 12px", fontSize: 14 }} title="Předchozí rok">‹</button>
                 <span style={{ fontSize: 14, fontWeight: 600, minWidth: 60, textAlign: "center" }}>{rocniRok}</span>
-                <button onClick={() => { const r = rocniRok+1; setRocniRok(r); loadRocniPrehled(r); }} style={{ ...S.btnS, padding: "6px 12px", fontSize: 14 }}>›</button>
+                <button onClick={() => { const r = rocniRok+1; setRocniRok(r); loadRocniPrehled(r); }} style={{ ...S.btnS, padding: "6px 12px", fontSize: 14 }} title="Následující rok">›</button>
+                {isAdmin && <button onClick={() => dogenerujRok(rocniRok)} style={{ ...S.btnS, fontSize: 12 }} title="Dogeneruje chybějící předpisy (! buňky) pro celý rok">! Dogenerovat chybějící</button>}
               </>}
             </div>
 
@@ -1046,15 +1151,28 @@ export default function App() {
                                       if (m.stav === "ok") { bg = isDark ? "rgba(34,197,94,0.15)" : "rgba(34,197,94,0.12)"; color = "#4ade80"; label = m.zapl ? fmt(m.zapl) : "✓"; }
                                       else if (m.stav === "nezapl") { bg = isDark ? "rgba(239,68,68,0.15)" : "rgba(239,68,68,0.1)"; color = "#f87171"; label = "✗"; }
                                       else if (m.stav === "chybi") { color = "#f59e0b"; label = "!"; }
+                                      const tipText = m.stav === "ok" ? `${MESICE[mi]}: zaplaceno ${fmt(m.zapl)} Kč (předpis ${fmt(m.predpis)} Kč)`
+                                        : m.stav === "nezapl" ? `${MESICE[mi]}: NEZAPLACENO — předpis ${fmt(m.predpis)} Kč. Klikni pro zadání platby.`
+                                        : m.stav === "chybi" ? `${MESICE[mi]}: Chybí předpis — smlouva byla aktivní ale předpis nebyl vygenerován. Klikni pro vytvoření.`
+                                        : `${MESICE[mi]}: Smlouva nebyla aktivní`;
                                       return (
-                                        <td key={mi} style={{ ...S.td, textAlign: "center", background: bg, color, fontWeight: m.stav === "ok" || m.stav === "nezapl" ? 600 : 400, cursor: m.platba ? "pointer" : "default", fontSize: 11 }}
+                                        <td key={mi} title={tipText}
+                                          style={{ ...S.td, textAlign: "center", background: bg, color, fontWeight: m.stav === "ok" || m.stav === "nezapl" ? 600 : 400, cursor: (m.platba || m.stav === "chybi") ? "pointer" : "default", fontSize: 11 }}
                                           onClick={() => {
                                             if (m.platba) {
                                               const pp2 = rocniPolozky.filter(x => x.platba_id === m.platba.id);
                                               setEditPlatba({ ...m.platba, polozky: pp2.map(x => ({...x})) });
+                                            } else if (m.stav === "chybi") {
+                                              // ! buňka — vytvoř předpis a otevři formulář
+                                              const saz = sazebnikKDatu(sml.id, rocniRok, mi + 1);
+                                              const polozkyData = saz ? sazebnikPolozky.filter(sp => sp.sazebnik_id === saz.id).map(sp => ({ nazev: sp.nazev, castka_predpis_kc: sp.castka_kc, _fromSazebnik: true })) : [];
+                                              // Najdi jednotku smlouvy
+                                              const jid = (smlouvaJednotky[sml.id] || [])[0];
+                                              if (jid) {
+                                                setEditPlatba({ smlouva_id: sml.id, jednotka_id: jid, rok: rocniRok, mesic: mi + 1, zaplaceno: false, polozky: polozkyData, _novy: true });
+                                              }
                                             }
-                                          }}
-                                          title={m.platba ? `${MESICE[mi]}: předpis ${fmt(m.predpis)} Kč, zaplaceno ${fmt(m.zapl)} Kč` : ""}>
+                                          }}>
                                           {label}
                                         </td>
                                       );
@@ -1329,12 +1447,18 @@ export default function App() {
         const smlDodatky = dodatky.filter(d => d.smlouva_id === s.id).sort((a,b) => b.datum.localeCompare(a.datum));
         const smlSazebnik = sazebnik.filter(sz => sz.smlouva_id === s.id).sort((a,b) => b.platne_od.localeCompare(a.platne_od));
         const smlVyuctovani = vyuctovani.filter(v => v.smlouva_id === s.id).sort((a,b) => b.datum.localeCompare(a.datum));
+        // FIX build0008: saldo počítáme z detailSmlPlatby — vždy načteno z DB
+        const vsechnyPlatby = detailSmlPlatby;
+        const vsechnyPP = detailSmlPolozky;
+        const celkemPredpis = vsechnyPP.reduce((sum,pp) => sum+(Number(pp.castka_predpis_kc||pp.predpis_kc)||0), 0);
+        const celkemZapl = vsechnyPlatby.reduce((sum,p) => sum+(Number(p.banka_kc)||0)+(Number(p.hotove_kc)||0)+(Number(p.doplatek_kc)||0), 0);
+        const saldo = celkemZapl - celkemPredpis;
         return (
           <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 2000, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "inherit" }}>
             <div style={{ background: surface, borderRadius: 16, width: "min(800px,96vw)", maxHeight: "90vh", overflow: "auto", border: `1px solid ${border}` }}>
               <div style={{ padding: "16px 24px", borderBottom: `1px solid ${border}`, display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, background: surface }}>
                 <span style={{ fontWeight: 700, fontSize: 15, color: text }}>📄 Detail smlouvy — {naj?.jmeno}</span>
-                <button onClick={() => setDetailSmlouva(null)} style={{ background: "none", border: "none", color: muted, fontSize: 20, cursor: "pointer" }}>✕</button>
+                <button onClick={() => { setDetailSmlouva(null); setDetailSmlPlatby([]); setDetailSmlPolozky([]); }} style={{ background: "none", border: "none", color: muted, fontSize: 20, cursor: "pointer" }}>✕</button>
               </div>
               <div style={{ padding: "20px 24px", display: "flex", flexDirection: "column", gap: 20 }}>
                 {/* Základní info */}
@@ -1346,33 +1470,26 @@ export default function App() {
                 {/* Jednotky */}
                 <div>
                   <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8, color: text }}>Jednotky v smlouvě</div>
-                  {jList.map(j => { const o = objekty.find(x => x.id === j.objekt_id); return <div key={j.id} style={{ fontSize: 13, color: muted, padding: "4px 0" }}>{o?.nazev ? `${o.nazev} / ` : ""}{j.cislo_bytu} — {j.typ}{j.plocha_m2 ? `, ${j.plocha_m2} m²` : ""}{j.lodzie_m2 ? `, lodžie ${j.lodzie_m2} m²` : ""}</div>; })}
+                  {jList.map(j => { const o = objekty.find(x => x.id === j.objekt_id); return <div key={j.id} style={{ fontSize: 13, color: muted, padding: "4px 0" }}>{o?.nazev ? `${o.nazev} / ` : ""}{j.cislo_bytu} — {j.typ}{j.soucast_bytu ? " (koje)" : ""}{j.plocha_m2 ? `, ${j.plocha_m2} m²` : ""}{j.lodzie_m2 ? `, lodžie ${j.lodzie_m2} m²` : ""}</div>; })}
                 </div>
-                {/* Celkové saldo smlouvy */}
-                {(() => {
-                  const vsechnyPlatby = platby.filter(p => p.smlouva_id === s.id);
-                  const vsechnyPP = platbyPolozky.filter(pp => vsechnyPlatby.some(p => p.id === pp.platba_id));
-                  const celkemPredpis = vsechnyPP.reduce((sum,pp) => sum+(Number(pp.castka_predpis_kc||pp.predpis_kc)||0), 0);
-                  const celkemZapl = vsechnyPlatby.reduce((sum,p) => sum+(Number(p.banka_kc)||0)+(Number(p.hotove_kc)||0)+(Number(p.doplatek_kc)||0), 0);
-                  const saldo = celkemZapl - celkemPredpis;
-                  const nezaplCount = vsechnyPlatby.filter(p => !p.zaplaceno).length;
-                  if (vsechnyPlatby.length === 0) return null;
-                  return (
-                    <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10 }}>
-                      {[
-                        { label: "Plateb celkem", value: vsechnyPlatby.length, color: "#60a5fa" },
-                        { label: "Předpis (∑)", value: fmtKc(celkemPredpis), color: text },
-                        { label: "Zaplaceno (∑)", value: fmtKc(celkemZapl), color: "#4ade80" },
-                        { label: saldo >= 0 ? "Přeplatek" : "Dluh", value: fmtKc(Math.abs(saldo)), color: saldo >= 0 ? "#4ade80" : "#f87171" },
-                      ].map(c => (
-                        <div key={c.label} style={{ padding: "10px 14px", background: isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.03)", borderRadius: 8, border: `0.5px solid ${border}` }}>
-                          <div style={{ fontSize: 11, color: muted, marginBottom: 4 }}>{c.label}</div>
-                          <div style={{ fontSize: 15, fontWeight: 700, color: c.color }}>{c.value}</div>
-                        </div>
-                      ))}
-                    </div>
-                  );
-                })()}
+                {/* Celkové saldo — z DB */}
+                {detailSmlLoading ? (
+                  <div style={{ color: muted, fontSize: 13 }}>Načítám saldo...</div>
+                ) : vsechnyPlatby.length > 0 ? (
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10 }}>
+                    {[
+                      { label: "Plateb celkem", value: vsechnyPlatby.length, color: "#60a5fa", tip: "Celkový počet měsíčních předpisů pro tuto smlouvu" },
+                      { label: "Předpis (∑)", value: fmtKc(celkemPredpis), color: text, tip: "Součet všech předpisů od začátku smlouvy" },
+                      { label: "Zaplaceno (∑)", value: fmtKc(celkemZapl), color: "#4ade80", tip: "Součet všech skutečně zaplacených plateb" },
+                      { label: saldo >= 0 ? "Přeplatek" : "Dluh", value: fmtKc(Math.abs(saldo)), color: saldo >= 0 ? "#4ade80" : "#f87171", tip: saldo >= 0 ? "Nájemník zaplatil více než byl předpis" : "Nájemník zaplatil méně než byl předpis" },
+                    ].map(c => (
+                      <div key={c.label} title={c.tip} style={{ padding: "10px 14px", background: isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.03)", borderRadius: 8, border: `0.5px solid ${border}`, cursor: "help" }}>
+                        <div style={{ fontSize: 11, color: muted, marginBottom: 4 }}>{c.label}</div>
+                        <div style={{ fontSize: 15, fontWeight: 700, color: c.color }}>{c.value}</div>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
                 {/* Sazebníky */}
                 <div>
                   <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8, color: text }}>Historie sazebníků</div>
@@ -1450,6 +1567,60 @@ export default function App() {
         <FormVyuctovani data={vyuctovaniForm} onChange={setVyuctovaniForm} onSave={saveVyuctovani} onCancel={() => setVyuctovaniForm(null)} S={S} muted={muted} text={text} />
       </Modal>}
 
+      {/* DIALOG: VADNÉ PŘEDPISY */}
+      {kontrolaPredpisuVysledek && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 2000, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "inherit" }}>
+          <div style={{ background: surface, borderRadius: 16, width: "min(600px,96vw)", maxHeight: "80vh", overflow: "auto", border: `1px solid ${border}` }}>
+            <div style={{ padding: "16px 24px", borderBottom: `1px solid ${border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontWeight: 700, fontSize: 15, color: text }}>🔍 Kontrola předpisů</span>
+              <button onClick={() => setKontrolaPredpisuVysledek(null)} style={{ background: "none", border: "none", color: muted, fontSize: 20, cursor: "pointer" }}>✕</button>
+            </div>
+            <div style={{ padding: "20px 24px" }}>
+              {kontrolaPredpisuVysledek.vadne.length === 0 ? (
+                <div style={{ textAlign: "center", padding: "20px 0" }}>
+                  <div style={{ fontSize: 36, marginBottom: 12 }}>✓</div>
+                  <div style={{ color: "#4ade80", fontWeight: 600, fontSize: 15 }}>Vše v pořádku!</div>
+                  <div style={{ color: muted, fontSize: 13, marginTop: 8 }}>Zkontrolováno {kontrolaPredpisuVysledek.celkem} předpisů — žádný není mimo dobu smlouvy.</div>
+                  <button onClick={() => setKontrolaPredpisuVysledek(null)} style={{ ...S.btnP, marginTop: 20 }}>Zavřít</button>
+                </div>
+              ) : (
+                <div>
+                  <div style={{ marginBottom: 16, padding: "10px 14px", background: "rgba(239,68,68,0.1)", borderRadius: 8, border: "1px solid rgba(239,68,68,0.3)", color: "#f87171", fontSize: 13 }}>
+                    Nalezeno <strong>{kontrolaPredpisuVysledek.vadne.length}</strong> předpisů mimo dobu platnosti smlouvy (z celkem {kontrolaPredpisuVysledek.celkem}).
+                    Tyto předpisy byly pravděpodobně vygenerovány před opravou v build0007.
+                  </div>
+                  <div style={{ maxHeight: 300, overflowY: "auto", marginBottom: 16 }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                      <thead><tr style={{ background: isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.03)" }}>
+                        {["Nájemník","Měsíc/Rok","Smlouva od","Smlouva do"].map(h => <th key={h} style={S.th}>{h}</th>)}
+                      </tr></thead>
+                      <tbody>
+                        {kontrolaPredpisuVysledek.vadne.map(p => {
+                          const sml = smlouvy.find(s => s.id === p.smlouva_id);
+                          const naj = sml ? najemnici.find(n => n.id === sml.najemnik_id) : null;
+                          return (
+                            <tr key={p.id} style={{ borderBottom: `1px solid ${border}` }}>
+                              <td style={{ ...S.td, color: "#f87171" }}>{naj?.jmeno || "?"}</td>
+                              <td style={S.td}>{MESICE[p.mesic-1]} {p.rok}</td>
+                              <td style={{ ...S.td, color: muted }}>{fmtDate(sml?.datum_od)}</td>
+                              <td style={{ ...S.td, color: muted }}>{fmtDate(sml?.datum_do) || "neurčito"}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <button onClick={() => setKontrolaPredpisuVysledek(null)} style={{ flex: 1, ...S.btnS }}>Ponechat</button>
+                    <button onClick={() => smazVadnePredpisy(kontrolaPredpisuVysledek.vadne)} style={{ flex: 1, ...S.btnD, fontWeight: 700 }}>Smazat {kontrolaPredpisuVysledek.vadne.length} vadných předpisů</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* LOG */}
       {showLog && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 2000, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "inherit" }}>
@@ -1494,6 +1665,32 @@ export default function App() {
               <div style={{ padding: "12px 16px", background: isDark ? "rgba(59,130,246,0.08)" : "rgba(59,130,246,0.06)", borderRadius: 10, border: `1px solid rgba(59,130,246,0.2)` }}>
                 <div style={{ fontWeight: 600, color: "#60a5fa", marginBottom: 6 }}>Jak aplikace funguje</div>
                 <div style={{ color: text, lineHeight: 1.6 }}>Aplikace eviduje podnájmy ve čtyřech vrstvách: <b>Jednotky</b> (byty, garáže, sklepy) → <b>Smlouvy</b> (kdo a jak dlouho) → <b>Sazebník</b> (kolik platí) → <b>Platby</b> (co skutečně přišlo).</div>
+              </div>
+
+              {/* Legenda symbolů */}
+              <div style={{ borderBottom: `1px solid ${border}`, paddingBottom: 16 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                  <span style={{ fontSize: 16 }}>🔣</span>
+                  <span style={{ fontWeight: 700, fontSize: 14, color: text }}>Legenda symbolů</span>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "6px 16px", fontSize: 13 }}>
+                  {[
+                    ["⚠️", "Smlouva propadla — datum konce je v minulosti. Okamžitě řeš prodloužení nebo ukončení."],
+                    ["⏰", "Smlouva končí do 60 dní — připrav prodloužení nebo výpověď."],
+                    ["!", "Chybí předpis — smlouva byla aktivní ale předpis nebyl vygenerován. Klikni na buňku pro vytvoření."],
+                    ["✓ zelená", "Platba zaplacena v tomto měsíci."],
+                    ["✗ červená", "Platba nezaplacena — nájemník dosud neuhradil. Klikni pro zadání platby."],
+                    ["— šedá", "Smlouva nebyla aktivní v daném měsíci (před začátkem nebo po konci smlouvy)."],
+                  ].map(([sym, popis]) => (
+                    <div key={sym} style={{ display: "contents" }}>
+                      <span style={{ fontWeight: 700, color: "#f59e0b", fontFamily: "monospace", fontSize: 14 }}>{sym}</span>
+                      <span style={{ color: muted, lineHeight: 1.5 }}>{popis}</span>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ marginTop: 10, fontSize: 12, color: muted, padding: "6px 10px", background: isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.03)", borderRadius: 6 }}>
+                  💡 Tip: Najeď myší na libovolnou hodnotu, tlačítko nebo kartičku — zobrazí se vysvětlení co dělá.
+                </div>
               </div>
 
               {/* Záložky */}
@@ -1668,6 +1865,17 @@ function FormJednotka({ data, onChange, onSave, onCancel, objekty, S, muted, tex
       <FormRow label="Lodžie (m²)" muted={muted}><input style={S.input} type="number" value={data.lodzie_m2||""} onChange={e=>onChange({...data,lodzie_m2:e.target.value})} /></FormRow>
     </div>
     <FormRow label="Stav" muted={muted}><select style={S.input} value={data.stav||"volná"} onChange={e=>onChange({...data,stav:e.target.value})}><option value="volná">Volná</option><option value="obsazený">Obsazená</option><option value="oprava">V opravě</option></select></FormRow>
+    {data.typ === "sklep" && (
+      <div title="Sklepní koje jako součást pronájmu bytu se nezobrazuje jako volná k samostatnému pronájmu." style={{padding:"10px 14px",background:"rgba(59,130,246,0.07)",borderRadius:8,border:"1px solid rgba(59,130,246,0.2)"}}>
+        <label style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer",fontSize:13,color:text}}>
+          <input type="checkbox" checked={data.soucast_bytu !== false} onChange={e=>onChange({...data,soucast_bytu:e.target.checked})} />
+          <div>
+            <div style={{fontWeight:600}}>Součást pronájmu bytu (koje)</div>
+            <div style={{fontSize:11,color:muted,marginTop:2}}>Zaškrtnuto = koje patří k bytu a nenabízí se samostatně. Odškrtni jen pokud ji chceš pronajímat zvlášť.</div>
+          </div>
+        </label>
+      </div>
+    )}
     <FormRow label="Poznámka" muted={muted}><textarea style={{...S.input,resize:"vertical",minHeight:60}} value={data.poznamka||""} onChange={e=>onChange({...data,poznamka:e.target.value})} /></FormRow>
     <div style={{display:"flex",gap:10}}><button onClick={onCancel} style={{flex:1,...S.btnS}}>Zrušit</button><button onClick={()=>onSave(data)} disabled={!data.cislo_bytu||!data.objekt_id} style={{flex:1,...S.btnP,opacity:(data.cislo_bytu&&data.objekt_id)?1:0.5}}>Uložit</button></div>
   </div>;
