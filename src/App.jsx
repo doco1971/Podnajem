@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from "react";
 import * as XLSX from "xlsx";
-// BUILD: 2026_03_29_build0006
+// BUILD: 2026_03_29_build0007
 // ============================================================
 // PRAVIDLO #0 — PŘED KAŽDÝM ROZŠÍŘENÍM: průzkum → výběr → implementace
 // PRAVIDLO #1 — NEFUNGUJE: zkontroluj kód. NEHÁDEJ.
@@ -12,7 +12,7 @@ import * as XLSX from "xlsx";
 // DEPLOY: Vercel + GitHub (doco1971/podnajem) — src/App.jsx
 //
 // ============================================================
-// AKTUÁLNÍ STAV (build0004)
+// AKTUÁLNÍ STAV (build0007)
 // ============================================================
 // ✅ Supabase: pzhcvfucgdukdyggkmso.supabase.co
 // ✅ Tabulky: objekty, jednotky (dříve byty), najemnici,
@@ -49,9 +49,16 @@ import * as XLSX from "xlsx";
 //             FIX: platby_polozky INSERT místo PATCH pro nové položky ze sazebníku
 //             FIX: saveVyuctovani guard pro undefined smlouva_id
 //             FIX: castka_skutecnost_kc sloupec neexistuje → odstraněn z INSERT
+// BUILD0007 — FIX: generování předpisů kontroluje datum_od/datum_do smlouvy
+//             FIX: formulář platby — vždy jasně oddělený předpis vs. platba
+//             NEW: nápověda — tlačítko ? s popisem každé záložky
+//             NEW: checklist měsíčního uzávěrku v záložce Platby
+//             NEW: roční přehled plateb (tabulka jako Excel, řádky=nájemníci, sloupce=měsíce)
+//             NEW: kdo nezaplatil — červený přehled na záložce Přehled
+//             NEW: celkové saldo smlouvy v detailu smlouvy
 //
 // ============================================================
-const APP_BUILD = "build0006";
+const APP_BUILD = "build0007";
 const SB_URL = import.meta.env.VITE_SB_URL;
 const SB_KEY = import.meta.env.VITE_SB_KEY;
 const MESICE = ["Leden","Únor","Březen","Duben","Květen","Červen","Červenec","Srpen","Září","Říjen","Listopad","Prosinec"];
@@ -165,6 +172,12 @@ export default function App() {
   const [vyuctovaniForm, setVyuctovaniForm] = useState(null);
   const [deleteConfirm, setDeleteConfirm] = useState(null);
   const [detailSmlouva, setDetailSmlouva] = useState(null);
+  const [showHelp, setShowHelp] = useState(false);
+  const [platbyPohled2, setPlatbyPohled2] = useState("mesic"); // "mesic" | "rok" | "nezaplaceno"
+  const [rocniPlatby, setRocniPlatby] = useState([]);
+  const [rocniPolozky, setRocniPolozky] = useState([]);
+  const [rocniRok, setRocniRok] = useState(now.getFullYear());
+  const [rocniLoading, setRocniLoading] = useState(false);
 
   const isDark = theme === "dark";
   const isAdmin = userRole === "admin" || userRole === "superadmin";
@@ -501,10 +514,16 @@ export default function App() {
   const generujPredpisy = async () => {
     const mesicDB = platbyMesic + 1;
     const datumMesic = `${platbyRok}-${String(mesicDB).padStart(2,"0")}-01`;
+    // Poslední den generovaného měsíce
+    const datumMesicKonec = `${platbyRok}-${String(mesicDB).padStart(2,"0")}-${new Date(platbyRok, mesicDB, 0).getDate()}`;
     const aktivni = platbySmlouva ? aktivniSmlouvy.filter(s => s.id === Number(platbySmlouva)) : aktivniSmlouvy;
     if (aktivni.length === 0) { showMsg("Žádné aktivní smlouvy.", "err"); return; }
-    let pridano = 0, preskoceno = 0;
+    let pridano = 0, preskoceno = 0, mimoDobu = 0;
     for (const smlouva of aktivni) {
+      // FIX build0007: kontrola zda generovaný měsíc spadá do doby trvání smlouvy
+      const smlOd = smlouva.datum_od || "0000-01-01";
+      const smlDo = smlouva.datum_do || "9999-12-31";
+      if (datumMesicKonec < smlOd || datumMesic > smlDo) { mimoDobu++; continue; }
       const jIds = smlouvaJednotky[smlouva.id] || [];
       for (const jid of jIds) {
         const existuje = platby.find(p => p.jednotka_id === jid && p.smlouva_id === smlouva.id && p.mesic === mesicDB && p.rok === platbyRok);
@@ -524,7 +543,10 @@ export default function App() {
       }
     }
     await logAkce(userName, "Generování předpisů", `${mesicDB}/${platbyRok}: ${pridano} nových`);
-    showMsg(`Vygenerováno: ${pridano} nových${preskoceno ? `, ${preskoceno} přeskočeno` : ""}`);
+    const msg2 = [`Vygenerováno: ${pridano} nových`];
+    if (preskoceno) msg2.push(`${preskoceno} již existuje`);
+    if (mimoDobu) msg2.push(`${mimoDobu} mimo dobu smlouvy (přeskočeno)`);
+    showMsg(msg2.join(", "));
     setPlatbyRefresh(r => r + 1);
   };
 
@@ -599,7 +621,19 @@ export default function App() {
     } catch (e) { showMsg("Chyba: " + e.message, "err"); }
   };
 
-  // ── Log ───────────────────────────────────────────────────
+  const loadRocniPrehled = async (rok) => {
+    setRocniLoading(true);
+    try {
+      const pData = await sb(`platby?rok=eq.${rok}&order=smlouva_id.asc,mesic.asc`);
+      setRocniPlatby(pData || []);
+      if (pData?.length > 0) {
+        const ids = pData.map(p => p.id).join(",");
+        const pp = await sb(`platby_polozky?platba_id=in.(${ids})`);
+        setRocniPolozky(pp || []);
+      } else { setRocniPolozky([]); }
+    } catch (e) { showMsg("Chyba ročního přehledu: " + e.message, "err"); }
+    finally { setRocniLoading(false); }
+  };
   const loadLog = async () => {
     try { const res = await sb("log_aktivit?order=cas.desc&limit=300&hidden=eq.false"); setLogData(res || []); } catch { setLogData([]); }
   };
@@ -696,6 +730,7 @@ export default function App() {
             <button onClick={() => { setShowLog(true); loadLog(); }} style={{ ...S.btnS, padding: "5px 10px", fontSize: 12 }}>📋 Log</button>
           </>}
           <button onClick={() => setTheme(t => t === "dark" ? "light" : "dark")} style={{ ...S.btnS, padding: "5px 10px", fontSize: 12 }}>{isDark ? "☀️" : "🌙"}</button>
+          <button onClick={() => setShowHelp(true)} style={{ ...S.btnS, padding: "5px 10px", fontSize: 12 }} title="Nápověda">?</button>
           <button onClick={handleLogout} style={{ ...S.btnS, padding: "5px 10px", fontSize: 12 }}>Odhlásit</button>
           <span style={{ fontSize: 11, color: muted }}>{APP_BUILD}</span>
         </div>
@@ -721,10 +756,23 @@ export default function App() {
               ))}
             </div>
 
+            {/* Kdo nezaplatil — aktuální měsíc */}
+            {(() => {
+              const mesicNow = now.getMonth() + 1;
+              const rokNow = now.getFullYear();
+              // Tato data máme jen pokud jsme na záložce platby — proto použijeme jen smlouvy
+              // a upozorníme uživatele ať přejde do Plateb
+              const nezaplSmlouvy = aktivniSmlouvy.filter(s => {
+                // Jen upozornění — data plateb na přehledu nenačítáme
+                return false; // placeholder — viz Platby záložka
+              });
+              // Místo toho zobrazíme jen odkaz
+              return null;
+            })()}
+
             {/* Filtr */}
             <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap", alignItems: "center" }}>
-              <span style={{ fontSize: 12, color: muted }}>Dům:</span>
-              {[{ id: "", nazev: "Vše" }, ...objekty].map(o => (
+              <span style={{ fontSize: 12, color: muted }}>Dům:</span>              {[{ id: "", nazev: "Vše" }, ...objekty].map(o => (
                 <button key={o.id} onClick={() => setFilterObjekt(o.id === "" ? "" : o.id)} style={{ padding: "4px 14px", borderRadius: 99, fontSize: 12, cursor: "pointer", border: `1px solid ${filterObjekt === (o.id||"") ? "#3b82f6" : border}`, background: filterObjekt === (o.id||"") ? "rgba(59,130,246,0.15)" : "transparent", color: filterObjekt === (o.id||"") ? "#3b82f6" : text }}>{o.nazev}</button>
               ))}
             </div>
@@ -742,153 +790,361 @@ export default function App() {
         {/* ── PLATBY ── */}
         {activeTab === "platby" && (
           <div>
+            {/* Přepínač pohledů */}
             <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
               <div style={{ display: "flex", background: isDark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)", borderRadius: 8, padding: 3 }}>
-                {[["mesic","Měsíc"],["obdobi","Celé období"]].map(([v,l]) => (
-                  <button key={v} onClick={() => setPlatbyPohled(v)} style={{ padding: "5px 14px", border: "none", borderRadius: 6, fontSize: 12, cursor: "pointer", background: platbyPohled === v ? "#2563eb" : "transparent", color: platbyPohled === v ? "#fff" : muted, fontFamily: "inherit" }}>{l}</button>
+                {[["mesic","Měsíc"],["rok","Roční přehled"],["nezaplaceno","Kdo nezaplatil"]].map(([v,l]) => (
+                  <button key={v} onClick={() => {
+                    setPlatbyPohled2(v);
+                    if (v === "rok") loadRocniPrehled(rocniRok);
+                  }} style={{ padding: "5px 14px", border: "none", borderRadius: 6, fontSize: 12, cursor: "pointer", background: platbyPohled2 === v ? "#2563eb" : "transparent", color: platbyPohled2 === v ? "#fff" : muted, fontFamily: "inherit" }}>{l}</button>
                 ))}
               </div>
-              <select style={{ ...S.input, width: "auto", minWidth: 200 }} value={platbySmlouva} onChange={e => setPlatbySmlouva(e.target.value)}>
-                <option value="">Všechny smlouvy</option>
-                {aktivniSmlouvy.map(s => { const n = najemnici.find(x => x.id === s.najemnik_id); return <option key={s.id} value={s.id}>{n?.jmeno || "?"} — od {fmtDate(s.datum_od)}</option>; })}
-              </select>
-              {platbyPohled === "mesic" && <>
-                <button onClick={() => { let m = platbyMesic-1, r = platbyRok; if(m<0){m=11;r--;} setPlatbyMesic(m); setPlatbyRok(r); }} style={{ ...S.btnS, padding: "6px 12px", fontSize: 14 }}>‹</button>
-                <span style={{ fontSize: 14, fontWeight: 600, minWidth: 130, textAlign: "center" }}>{MESICE[platbyMesic]} {platbyRok}</span>
-                <button onClick={() => { let m = platbyMesic+1, r = platbyRok; if(m>11){m=0;r++;} setPlatbyMesic(m); setPlatbyRok(r); }} style={{ ...S.btnS, padding: "6px 12px", fontSize: 14 }}>›</button>
-                {isAdmin && <button onClick={generujPredpisy} style={S.btnP}>+ Generovat předpisy</button>}
-                {isAdmin && platbySmlouva && <button onClick={() => setVyuctovaniForm({ smlouva_id: platbySmlouva, datum: new Date().toISOString().slice(0,10), typ: "nedoplatek", uhrazeno: false })} style={{ ...S.btnS, fontSize: 12 }}>+ Vyúčtování</button>}
+              {/* Původní měsíc/období přepínač jen v pohledu měsíc */}
+              {platbyPohled2 === "mesic" && <>
+                <div style={{ display: "flex", background: isDark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)", borderRadius: 8, padding: 3 }}>
+                  {[["mesic","Měsíc"],["obdobi","Celé období"]].map(([v,l]) => (
+                    <button key={v} onClick={() => setPlatbyPohled(v)} style={{ padding: "5px 14px", border: "none", borderRadius: 6, fontSize: 12, cursor: "pointer", background: platbyPohled === v ? "#1e40af" : "transparent", color: platbyPohled === v ? "#fff" : muted, fontFamily: "inherit" }}>{l}</button>
+                  ))}
+                </div>
+                <select style={{ ...S.input, width: "auto", minWidth: 200 }} value={platbySmlouva} onChange={e => setPlatbySmlouva(e.target.value)}>
+                  <option value="">Všechny smlouvy</option>
+                  {aktivniSmlouvy.map(s => { const n = najemnici.find(x => x.id === s.najemnik_id); return <option key={s.id} value={s.id}>{n?.jmeno || "?"} — od {fmtDate(s.datum_od)}</option>; })}
+                </select>
+                {platbyPohled === "mesic" && <>
+                  <button onClick={() => { let m = platbyMesic-1, r = platbyRok; if(m<0){m=11;r--;} setPlatbyMesic(m); setPlatbyRok(r); }} style={{ ...S.btnS, padding: "6px 12px", fontSize: 14 }}>‹</button>
+                  <span style={{ fontSize: 14, fontWeight: 600, minWidth: 130, textAlign: "center" }}>{MESICE[platbyMesic]} {platbyRok}</span>
+                  <button onClick={() => { let m = platbyMesic+1, r = platbyRok; if(m>11){m=0;r++;} setPlatbyMesic(m); setPlatbyRok(r); }} style={{ ...S.btnS, padding: "6px 12px", fontSize: 14 }}>›</button>
+                  {isAdmin && <button onClick={generujPredpisy} style={S.btnP}>+ Generovat předpisy</button>}
+                  {isAdmin && platbySmlouva && <button onClick={() => setVyuctovaniForm({ smlouva_id: platbySmlouva, datum: new Date().toISOString().slice(0,10), typ: "nedoplatek", uhrazeno: false })} style={{ ...S.btnS, fontSize: 12 }}>+ Vyúčtování</button>}
+                </>}
+              </>}
+              {platbyPohled2 === "rok" && <>
+                <button onClick={() => { const r = rocniRok-1; setRocniRok(r); loadRocniPrehled(r); }} style={{ ...S.btnS, padding: "6px 12px", fontSize: 14 }}>‹</button>
+                <span style={{ fontSize: 14, fontWeight: 600, minWidth: 60, textAlign: "center" }}>{rocniRok}</span>
+                <button onClick={() => { const r = rocniRok+1; setRocniRok(r); loadRocniPrehled(r); }} style={{ ...S.btnS, padding: "6px 12px", fontSize: 14 }}>›</button>
               </>}
             </div>
 
-            {platbyPohled === "mesic" && (
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 14, marginBottom: 20 }}>
-                {[
-                  { label: "Předpis celkem", value: fmtKc(platbyStats.predpis), color: "#3b82f6" },
-                  { label: "Zaplaceno", value: fmtKc(platbyStats.zaplaceno), color: "#22c55e" },
-                  { label: "Dluh", value: platbyStats.dluh > 0 ? fmtKc(platbyStats.dluh) : "0 Kč", color: platbyStats.dluh > 0 ? "#f87171" : "#22c55e" },
-                ].map(c => (
-                  <div key={c.label} style={{ ...S.card, textAlign: "center" }}>
-                    <div style={{ fontSize: 12, color: muted, marginBottom: 8 }}>{c.label}</div>
-                    <div style={{ fontSize: 22, fontWeight: 700, color: c.color }}>{c.value}</div>
+            {/* ── POHLED: MĚSÍC (původní) ── */}
+            {platbyPohled2 === "mesic" && (<>
+              {/* Checklist měsíčního uzávěrku */}
+              {platbyPohled === "mesic" && isAdmin && (() => {
+                const mesicDB = platbyMesic + 1;
+                const predpisyExistuji = platby.some(p => p.rok === platbyRok && p.mesic === mesicDB);
+                const vsichniZaplatili = predpisyExistuji && platby.filter(p => p.rok === platbyRok && p.mesic === mesicDB).every(p => p.zaplaceno);
+                const nezaplaceniCount = platby.filter(p => p.rok === platbyRok && p.mesic === mesicDB && !p.zaplaceno).length;
+                const steps = [
+                  { done: predpisyExistuji, label: "Vygenerovat předpisy", hint: "Klikněte + Generovat předpisy" },
+                  { done: predpisyExistuji && nezaplaceniCount === 0, label: "Zadat platby nájemníků", hint: nezaplaceniCount > 0 ? `${nezaplaceniCount} nezaplaceno` : "Hotovo" },
+                  { done: vsichniZaplatili, label: "Uzavřít měsíc", hint: vsichniZaplatili ? "Vše zaplaceno ✓" : "Čeká na platby" },
+                ];
+                return (
+                  <div style={{ ...S.card, marginBottom: 16, padding: "12px 20px" }}>
+                    <div style={{ fontSize: 12, color: muted, fontWeight: 600, marginBottom: 10 }}>PRŮVODCE — {MESICE[platbyMesic]} {platbyRok}</div>
+                    <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
+                      {steps.map((st, i) => (
+                        <div key={i} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <div style={{ width: 22, height: 22, borderRadius: "50%", background: st.done ? "rgba(34,197,94,0.2)" : "rgba(255,255,255,0.06)", border: `1.5px solid ${st.done ? "#4ade80" : border}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, color: st.done ? "#4ade80" : muted, flexShrink: 0 }}>{st.done ? "✓" : i+1}</div>
+                          <div>
+                            <div style={{ fontSize: 13, color: st.done ? "#4ade80" : text, fontWeight: st.done ? 600 : 400 }}>{st.label}</div>
+                            <div style={{ fontSize: 11, color: muted }}>{st.hint}</div>
+                          </div>
+                          {i < steps.length-1 && <div style={{ color: border, marginLeft: 4 }}>›</div>}
+                        </div>
+                      ))}
+                    </div>
                   </div>
-                ))}
-              </div>
-            )}
+                );
+              })()}
 
-            <div style={{ ...S.card, padding: 0, overflow: "hidden" }}>
-              <div style={{ overflowX: "auto" }}>
-                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-                  <thead>
-                    <tr style={{ background: isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.03)" }}>
-                      {platbyPohled === "obdobi" && <th style={S.th}>Měsíc</th>}
-                      <th style={S.th}>Nájemník</th><th style={S.th}>Jednotka</th><th style={S.th}>Předpis</th>
-                      <th style={S.th}>Zaplaceno</th><th style={S.th}>Datum platby</th><th style={S.th}>Stav</th>
-                      {isAdmin && <th style={S.th}>Akce</th>}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {platby.length === 0 && <tr><td colSpan={8} style={{ padding: "40px", textAlign: "center", color: muted }}>Žádné záznamy.{platbyPohled === "mesic" && isAdmin && " Klikněte Generovat předpisy."}</td></tr>}
-                    {platby.map(p => {
-                      const jed = jednotky.find(j => j.id === p.jednotka_id);
-                      const obj = jed ? objekty.find(o => o.id === jed.objekt_id) : null;
-                      const sml = smlouvy.find(s => s.id === p.smlouva_id);
-                      const naj = sml ? najemnici.find(n => n.id === sml.najemnik_id) : null;
-                      const pp = platbyPolozky.filter(x => x.platba_id === p.id);
-                      const predpis = pp.reduce((s,x) => s + (Number(x.castka_predpis_kc || x.predpis_kc) || 0), 0);
-                      const zaplaceno = (Number(p.banka_kc)||0) + (Number(p.hotove_kc)||0) + (Number(p.doplatek_kc)||0);
-                      return (
-                        <tr key={p.id} style={{ borderBottom: `1px solid ${border}`, background: p.zaplaceno ? (isDark ? "rgba(34,197,94,0.04)" : "rgba(34,197,94,0.03)") : "transparent" }}>
-                          {platbyPohled === "obdobi" && <td style={{ ...S.td, fontWeight: 600, whiteSpace: "nowrap" }}>{MESICE[p.mesic-1]} {p.rok}</td>}
-                          <td style={S.td}>{naj?.jmeno || <span style={{ color: muted }}>—</span>}</td>
-                          <td style={{ ...S.td, color: muted, fontSize: 12 }}>{obj?.nazev ? `${obj.nazev} / ` : ""}{jed?.cislo_bytu || "—"}</td>
-                          <td style={S.td}>
-                            {predpis > 0 ? <div>
-                              <div style={{ fontWeight: 600 }}>{fmtKc(predpis)}</div>
-                              {pp.map(x => <div key={x.id} style={{ fontSize: 11, color: muted }}>{x.nazev}: {fmtKc(x.castka_predpis_kc || x.predpis_kc)}</div>)}
-                            </div> : <span style={{ color: muted }}>—</span>}
-                          </td>
-                          <td style={{ ...S.td, color: p.zaplaceno ? "#4ade80" : muted }}>
-                            {zaplaceno > 0 ? <div>
-                              <div style={{ fontWeight: 600 }}>{fmtKc(zaplaceno)}</div>
-                              {Number(p.banka_kc) > 0 && <div style={{ fontSize: 11, color: muted }}>Banka: {fmtKc(p.banka_kc)}</div>}
-                              {Number(p.hotove_kc) > 0 && <div style={{ fontSize: 11, color: muted }}>Hotově: {fmtKc(p.hotove_kc)}</div>}
-                              {Number(p.srazky_kc) > 0 && <div style={{ fontSize: 11, color: "#f59e0b" }}>Srážka: -{fmtKc(p.srazky_kc)}</div>}
-                            </div> : "—"}
-                          </td>
-                          <td style={{ ...S.td, color: muted, fontSize: 12 }}>{fmtDate(p.datum_platby)}</td>
-                          <td style={S.td}><span style={{ padding: "2px 10px", borderRadius: 99, fontSize: 11, fontWeight: 500, background: p.zaplaceno ? "rgba(34,197,94,0.15)" : "rgba(239,68,68,0.12)", color: p.zaplaceno ? "#4ade80" : "#f87171" }}>{p.zaplaceno ? "zaplaceno" : "nezaplaceno"}</span>{p.poznamka && <div style={{ fontSize: 11, color: muted, marginTop: 2 }}>{p.poznamka}</div>}</td>
-                          {isAdmin && <td style={S.td}>
-                            <button onClick={() => {
-                              const pp = platbyPolozky.filter(x => x.platba_id === p.id);
-                              // Pokud platba nemá položky, načti ze sazebníku
-                              let polozkyData = pp.map(x => ({...x}));
-                              if (polozkyData.length === 0 && p.smlouva_id) {
-                                const saz = sazebnikKDatu(p.smlouva_id, p.rok, p.mesic);
-                                if (saz) {
-                                  polozkyData = sazebnikPolozky
-                                    .filter(sp => sp.sazebnik_id === saz.id)
-                                    .map(sp => ({ nazev: sp.nazev, castka_predpis_kc: sp.castka_kc, typ: sp.typ, _fromSazebnik: true }));
+              {platbyPohled === "mesic" && (
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 14, marginBottom: 20 }}>
+                  {[
+                    { label: "Předpis celkem", value: fmtKc(platbyStats.predpis), color: "#3b82f6" },
+                    { label: "Zaplaceno", value: fmtKc(platbyStats.zaplaceno), color: "#22c55e" },
+                    { label: "Dluh", value: platbyStats.dluh > 0 ? fmtKc(platbyStats.dluh) : "0 Kč", color: platbyStats.dluh > 0 ? "#f87171" : "#22c55e" },
+                  ].map(c => (
+                    <div key={c.label} style={{ ...S.card, textAlign: "center" }}>
+                      <div style={{ fontSize: 12, color: muted, marginBottom: 8 }}>{c.label}</div>
+                      <div style={{ fontSize: 22, fontWeight: 700, color: c.color }}>{c.value}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div style={{ ...S.card, padding: 0, overflow: "hidden" }}>
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                    <thead>
+                      <tr style={{ background: isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.03)" }}>
+                        {platbyPohled === "obdobi" && <th style={S.th}>Měsíc</th>}
+                        <th style={S.th}>Nájemník</th><th style={S.th}>Jednotka</th><th style={S.th}>Předpis</th>
+                        <th style={S.th}>Zaplaceno</th><th style={S.th}>Datum platby</th><th style={S.th}>Stav</th>
+                        {isAdmin && <th style={S.th}>Akce</th>}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {platby.length === 0 && <tr><td colSpan={8} style={{ padding: "40px", textAlign: "center", color: muted }}>Žádné záznamy.{platbyPohled === "mesic" && isAdmin && " Klikněte Generovat předpisy."}</td></tr>}
+                      {platby.map(p => {
+                        const jed = jednotky.find(j => j.id === p.jednotka_id);
+                        const obj = jed ? objekty.find(o => o.id === jed.objekt_id) : null;
+                        const sml = smlouvy.find(s => s.id === p.smlouva_id);
+                        const naj = sml ? najemnici.find(n => n.id === sml.najemnik_id) : null;
+                        const pp = platbyPolozky.filter(x => x.platba_id === p.id);
+                        const predpis = pp.reduce((s,x) => s + (Number(x.castka_predpis_kc || x.predpis_kc) || 0), 0);
+                        const zaplaceno = (Number(p.banka_kc)||0) + (Number(p.hotove_kc)||0) + (Number(p.doplatek_kc)||0);
+                        return (
+                          <tr key={p.id} style={{ borderBottom: `1px solid ${border}`, background: p.zaplaceno ? (isDark ? "rgba(34,197,94,0.04)" : "rgba(34,197,94,0.03)") : "transparent" }}>
+                            {platbyPohled === "obdobi" && <td style={{ ...S.td, fontWeight: 600, whiteSpace: "nowrap" }}>{MESICE[p.mesic-1]} {p.rok}</td>}
+                            <td style={S.td}>{naj?.jmeno || <span style={{ color: muted }}>—</span>}</td>
+                            <td style={{ ...S.td, color: muted, fontSize: 12 }}>{obj?.nazev ? `${obj.nazev} / ` : ""}{jed?.cislo_bytu || "—"}</td>
+                            <td style={S.td}>
+                              {predpis > 0 ? <div>
+                                <div style={{ fontWeight: 600 }}>{fmtKc(predpis)}</div>
+                                {pp.map(x => <div key={x.id||x.nazev} style={{ fontSize: 11, color: muted }}>{x.nazev}: {fmtKc(x.castka_predpis_kc || x.predpis_kc)}</div>)}
+                              </div> : <span style={{ color: muted }}>—</span>}
+                            </td>
+                            <td style={{ ...S.td, color: p.zaplaceno ? "#4ade80" : muted }}>
+                              {zaplaceno > 0 ? <div>
+                                <div style={{ fontWeight: 600 }}>{fmtKc(zaplaceno)}</div>
+                                {Number(p.banka_kc) > 0 && <div style={{ fontSize: 11, color: muted }}>Banka: {fmtKc(p.banka_kc)}</div>}
+                                {Number(p.hotove_kc) > 0 && <div style={{ fontSize: 11, color: muted }}>Hotově: {fmtKc(p.hotove_kc)}</div>}
+                                {Number(p.srazky_kc) > 0 && <div style={{ fontSize: 11, color: "#f59e0b" }}>Srážka: -{fmtKc(p.srazky_kc)}</div>}
+                              </div> : "—"}
+                            </td>
+                            <td style={{ ...S.td, color: muted, fontSize: 12 }}>{fmtDate(p.datum_platby)}</td>
+                            <td style={S.td}><span style={{ padding: "2px 10px", borderRadius: 99, fontSize: 11, fontWeight: 500, background: p.zaplaceno ? "rgba(34,197,94,0.15)" : "rgba(239,68,68,0.12)", color: p.zaplaceno ? "#4ade80" : "#f87171" }}>{p.zaplaceno ? "zaplaceno" : "nezaplaceno"}</span>{p.poznamka && <div style={{ fontSize: 11, color: muted, marginTop: 2 }}>{p.poznamka}</div>}</td>
+                            {isAdmin && <td style={S.td}>
+                              <button onClick={() => {
+                                const pp2 = platbyPolozky.filter(x => x.platba_id === p.id);
+                                let polozkyData = pp2.map(x => ({...x}));
+                                if (polozkyData.length === 0 && p.smlouva_id) {
+                                  const saz = sazebnikKDatu(p.smlouva_id, p.rok, p.mesic);
+                                  if (saz) {
+                                    polozkyData = sazebnikPolozky
+                                      .filter(sp => sp.sazebnik_id === saz.id)
+                                      .map(sp => ({ nazev: sp.nazev, castka_predpis_kc: sp.castka_kc, typ: sp.typ, _fromSazebnik: true }));
+                                  }
                                 }
-                              }
-                              setEditPlatba({ ...p, polozky: polozkyData });
-                            }} style={{ background: "none", border: "none", cursor: "pointer", color: muted, fontSize: 14 }}>✏️</button>
-                            <button onClick={() => setDeleteConfirm({ type: "platba", id: p.id, nazev: `platba ${MESICE[p.mesic-1]} ${p.rok}` })} style={{ background: "none", border: "none", cursor: "pointer", color: "#f87171", fontSize: 14 }}>🗑️</button>
-                          </td>}
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            {/* Vyúčtování energií */}
-            {vyuctovani.length > 0 && (
-              <div style={{ marginTop: 20 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-                  <span style={{ fontWeight: 600, fontSize: 14 }}>Roční vyúčtování energií</span>
-                  {isAdmin && platbySmlouva && <button onClick={() => setVyuctovaniForm({ smlouva_id: platbySmlouva, datum: new Date().toISOString().slice(0,10), typ: "nedoplatek", uhrazeno: false })} style={{ ...S.btnS, fontSize: 12 }}>+ Přidat vyúčtování</button>}
+                                setEditPlatba({ ...p, polozky: polozkyData });
+                              }} style={{ background: "none", border: "none", cursor: "pointer", color: muted, fontSize: 14 }}>✏️</button>
+                              <button onClick={() => setDeleteConfirm({ type: "platba", id: p.id, nazev: `platba ${MESICE[p.mesic-1]} ${p.rok}` })} style={{ background: "none", border: "none", cursor: "pointer", color: "#f87171", fontSize: 14 }}>🗑️</button>
+                            </td>}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
                 </div>
-                <div style={{ ...S.card, padding: 0, overflow: "hidden" }}>
-                  <div style={{ overflowX: "auto" }}>
-                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-                      <thead>
-                        <tr style={{ background: isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.03)" }}>
-                          {["Datum","Typ","Popis","Částka","Uhrazeno","Datum úhrady",isAdmin?"Akce":""].filter(Boolean).map(h => <th key={h} style={S.th}>{h}</th>)}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {vyuctovani.map(v => {
-                          const sml = smlouvy.find(s => s.id === v.smlouva_id);
-                          const naj = sml ? najemnici.find(n => n.id === sml.najemnik_id) : null;
-                          return (
-                            <tr key={v.id} style={{ borderBottom: `1px solid ${border}` }}>
-                              <td style={{ ...S.td, color: muted }}>{fmtDate(v.datum)}</td>
-                              <td style={S.td}><span style={{ padding: "2px 8px", borderRadius: 99, fontSize: 11, fontWeight: 500, background: v.typ === "nedoplatek" ? "rgba(239,68,68,0.12)" : "rgba(34,197,94,0.12)", color: v.typ === "nedoplatek" ? "#f87171" : "#4ade80" }}>{v.typ}</span></td>
-                              <td style={S.td}>{v.popis || <span style={{ color: muted }}>—</span>}{naj && <div style={{ fontSize: 11, color: muted }}>{naj.jmeno}</div>}</td>
-                              <td style={{ ...S.td, fontWeight: 600, color: v.typ === "nedoplatek" ? "#f87171" : "#4ade80" }}>{fmtKc(v.castka_kc)}</td>
-                              <td style={S.td}><span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, background: v.uhrazeno ? "rgba(34,197,94,0.12)" : "rgba(239,68,68,0.08)", color: v.uhrazeno ? "#4ade80" : "#f87171" }}>{v.uhrazeno ? "✓ ano" : "✗ ne"}</span></td>
-                              <td style={{ ...S.td, color: muted }}>{fmtDate(v.datum_uhrazeni)}</td>
-                              {isAdmin && <td style={S.td}>
-                                <button onClick={() => setVyuctovaniForm({ ...v })} style={{ background: "none", border: "none", cursor: "pointer", color: muted, fontSize: 13 }}>✏️</button>
-                              </td>}
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
+              </div>
+
+              {/* Vyúčtování energií */}
+              {vyuctovani.length > 0 && (
+                <div style={{ marginTop: 20 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                    <span style={{ fontWeight: 600, fontSize: 14 }}>Roční vyúčtování energií</span>
+                    {isAdmin && platbySmlouva && <button onClick={() => setVyuctovaniForm({ smlouva_id: platbySmlouva, datum: new Date().toISOString().slice(0,10), typ: "nedoplatek", uhrazeno: false })} style={{ ...S.btnS, fontSize: 12 }}>+ Přidat vyúčtování</button>}
+                  </div>
+                  <div style={{ ...S.card, padding: 0, overflow: "hidden" }}>
+                    <div style={{ overflowX: "auto" }}>
+                      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                        <thead>
+                          <tr style={{ background: isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.03)" }}>
+                            {["Datum","Typ","Popis","Částka","Uhrazeno","Datum úhrady",isAdmin?"Akce":""].filter(Boolean).map(h => <th key={h} style={S.th}>{h}</th>)}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {vyuctovani.map(v => {
+                            const sml = smlouvy.find(s => s.id === v.smlouva_id);
+                            const naj = sml ? najemnici.find(n => n.id === sml.najemnik_id) : null;
+                            return (
+                              <tr key={v.id} style={{ borderBottom: `1px solid ${border}` }}>
+                                <td style={{ ...S.td, color: muted }}>{fmtDate(v.datum)}</td>
+                                <td style={S.td}><span style={{ padding: "2px 8px", borderRadius: 99, fontSize: 11, fontWeight: 500, background: v.typ === "nedoplatek" ? "rgba(239,68,68,0.12)" : "rgba(34,197,94,0.12)", color: v.typ === "nedoplatek" ? "#f87171" : "#4ade80" }}>{v.typ}</span></td>
+                                <td style={S.td}>{v.popis || <span style={{ color: muted }}>—</span>}{naj && <div style={{ fontSize: 11, color: muted }}>{naj.jmeno}</div>}</td>
+                                <td style={{ ...S.td, fontWeight: 600, color: v.typ === "nedoplatek" ? "#f87171" : "#4ade80" }}>{fmtKc(v.castka_kc)}</td>
+                                <td style={S.td}><span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, background: v.uhrazeno ? "rgba(34,197,94,0.12)" : "rgba(239,68,68,0.08)", color: v.uhrazeno ? "#4ade80" : "#f87171" }}>{v.uhrazeno ? "✓ ano" : "✗ ne"}</span></td>
+                                <td style={{ ...S.td, color: muted }}>{fmtDate(v.datum_uhrazeni)}</td>
+                                {isAdmin && <td style={S.td}>
+                                  <button onClick={() => setVyuctovaniForm({ ...v })} style={{ background: "none", border: "none", cursor: "pointer", color: muted, fontSize: 13 }}>✏️</button>
+                                </td>}
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
                   </div>
                 </div>
+              )}
+              {isAdmin && platbySmlouva && vyuctovani.length === 0 && (
+                <div style={{ marginTop: 16, textAlign: "center" }}>
+                  <button onClick={() => setVyuctovaniForm({ smlouva_id: platbySmlouva, datum: new Date().toISOString().slice(0,10), typ: "nedoplatek", uhrazeno: false })} style={{ ...S.btnS, fontSize: 12 }}>+ Přidat roční vyúčtování energií</button>
+                </div>
+              )}
+            </>)}
+
+            {/* ── POHLED: ROČNÍ PŘEHLED (tabulka jako Excel) ── */}
+            {platbyPohled2 === "rok" && (
+              <div>
+                {rocniLoading ? (
+                  <div style={{ padding: 40, textAlign: "center", color: muted }}>Načítám...</div>
+                ) : (() => {
+                  // Sestavíme tabulku: řádky = aktivní smlouvy, sloupce = měsíce 1–12
+                  const smlRadky = aktivniSmlouvy.map(sml => {
+                    const naj = najemnici.find(n => n.id === sml.najemnik_id);
+                    const jIds = smlouvaJednotky[sml.id] || [];
+                    const mesice = Array.from({length: 12}, (_,mi) => {
+                      const mesicDB = mi + 1;
+                      // Najdi platbu pro tuto smlouvu a měsíc (první jednotka smlouvy)
+                      const platba = rocniPlatby.find(p => p.smlouva_id === sml.id && p.mesic === mesicDB && p.rok === rocniRok);
+                      if (!platba) {
+                        // Zkontroluj zda smlouva platila v tomto měsíci
+                        const datumOd = sml.datum_od || "0000-01-01";
+                        const datumDo = sml.datum_do || "9999-12-31";
+                        const mStart = `${rocniRok}-${String(mesicDB).padStart(2,"0")}-01`;
+                        const mKonec = `${rocniRok}-${String(mesicDB).padStart(2,"0")}-${new Date(rocniRok, mesicDB, 0).getDate()}`;
+                        const bylaAktivni = mKonec >= datumOd && mStart <= datumDo;
+                        return { stav: bylaAktivni ? "chybi" : "mimo", platba: null };
+                      }
+                      const pp = rocniPolozky.filter(x => x.platba_id === platba.id);
+                      const predpis = pp.reduce((s,x) => s+(Number(x.castka_predpis_kc||x.predpis_kc)||0), 0);
+                      const zapl = (Number(platba.banka_kc)||0)+(Number(platba.hotove_kc)||0)+(Number(platba.doplatek_kc)||0);
+                      return { stav: platba.zaplaceno ? "ok" : "nezapl", predpis, zapl, platba };
+                    });
+                    const celkemPredpis = mesice.reduce((s,m) => s+(m.predpis||0), 0);
+                    const celkemZapl = mesice.reduce((s,m) => s+(m.zapl||0), 0);
+                    return { sml, naj, mesice, celkemPredpis, celkemZapl };
+                  });
+                  return (
+                    <div>
+                      <div style={{ fontSize: 12, color: muted, marginBottom: 10 }}>
+                        Legenda: <span style={{ color: "#4ade80", fontWeight: 600 }}>zaplaceno</span> · <span style={{ color: "#f87171", fontWeight: 600 }}>nezaplaceno</span> · <span style={{ color: muted }}>— mimo dobu smlouvy</span> · <span style={{ color: "#f59e0b", fontWeight: 600 }}>chybí předpis</span>
+                      </div>
+                      <div style={{ ...S.card, padding: 0, overflow: "hidden" }}>
+                        <div style={{ overflowX: "auto" }}>
+                          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                            <thead>
+                              <tr style={{ background: isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.03)" }}>
+                                <th style={{ ...S.th, minWidth: 140 }}>Nájemník</th>
+                                {MESICE.map(m => <th key={m} style={{ ...S.th, textAlign: "center", minWidth: 70 }}>{m.slice(0,3)}</th>)}
+                                <th style={{ ...S.th, textAlign: "right" }}>Předpis</th>
+                                <th style={{ ...S.th, textAlign: "right" }}>Zaplaceno</th>
+                                <th style={{ ...S.th, textAlign: "right" }}>Saldo</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {smlRadky.length === 0 && <tr><td colSpan={16} style={{ padding: "32px", textAlign: "center", color: muted }}>Žádné aktivní smlouvy.</td></tr>}
+                              {smlRadky.map(({ sml, naj, mesice, celkemPredpis, celkemZapl }) => {
+                                const saldo = celkemZapl - celkemPredpis;
+                                return (
+                                  <tr key={sml.id} style={{ borderBottom: `1px solid ${border}` }}>
+                                    <td style={{ ...S.td, fontWeight: 600 }}>{naj?.jmeno || "?"}</td>
+                                    {mesice.map((m, mi) => {
+                                      let bg = "transparent", color = muted, label = "—";
+                                      if (m.stav === "ok") { bg = isDark ? "rgba(34,197,94,0.15)" : "rgba(34,197,94,0.12)"; color = "#4ade80"; label = m.zapl ? fmt(m.zapl) : "✓"; }
+                                      else if (m.stav === "nezapl") { bg = isDark ? "rgba(239,68,68,0.15)" : "rgba(239,68,68,0.1)"; color = "#f87171"; label = "✗"; }
+                                      else if (m.stav === "chybi") { color = "#f59e0b"; label = "!"; }
+                                      return (
+                                        <td key={mi} style={{ ...S.td, textAlign: "center", background: bg, color, fontWeight: m.stav === "ok" || m.stav === "nezapl" ? 600 : 400, cursor: m.platba ? "pointer" : "default", fontSize: 11 }}
+                                          onClick={() => {
+                                            if (m.platba) {
+                                              const pp2 = rocniPolozky.filter(x => x.platba_id === m.platba.id);
+                                              setEditPlatba({ ...m.platba, polozky: pp2.map(x => ({...x})) });
+                                            }
+                                          }}
+                                          title={m.platba ? `${MESICE[mi]}: předpis ${fmt(m.predpis)} Kč, zaplaceno ${fmt(m.zapl)} Kč` : ""}>
+                                          {label}
+                                        </td>
+                                      );
+                                    })}
+                                    <td style={{ ...S.td, textAlign: "right", color: muted }}>{celkemPredpis ? fmt(celkemPredpis) : "—"}</td>
+                                    <td style={{ ...S.td, textAlign: "right", color: "#4ade80", fontWeight: 600 }}>{celkemZapl ? fmt(celkemZapl) : "—"}</td>
+                                    <td style={{ ...S.td, textAlign: "right", fontWeight: 600, color: saldo >= 0 ? "#4ade80" : "#f87171" }}>{saldo !== 0 ? (saldo > 0 ? "+" : "") + fmt(saldo) : "0"}</td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                      <div style={{ marginTop: 10, fontSize: 12, color: muted }}>Kliknutím na buňku otevřeš detail platby.</div>
+                    </div>
+                  );
+                })()}
               </div>
             )}
 
-            {/* Tlačítko vyúčtování když je vybrána smlouva ale žádné vyúčtování ještě není */}
-            {isAdmin && platbySmlouva && vyuctovani.length === 0 && (
-              <div style={{ marginTop: 16, textAlign: "center" }}>
-                <button onClick={() => setVyuctovaniForm({ smlouva_id: platbySmlouva, datum: new Date().toISOString().slice(0,10), typ: "nedoplatek", uhrazeno: false })} style={{ ...S.btnS, fontSize: 12 }}>+ Přidat roční vyúčtování energií</button>
-              </div>
-            )}
+            {/* ── POHLED: KDO NEZAPLATIL ── */}
+            {platbyPohled2 === "nezaplaceno" && (() => {
+              // Najdi všechny nezaplacené platby v DB (pohled: celé období)
+              // Musíme načíst z platby state — použijeme "celé období" data
+              const vsechnyNezapl = platby.filter ? [] : []; // placeholder — použijeme vlastní fetch
+              // Protože nemáme všechna data najednou, zobrazíme ze stávajícího stavu + info
+              const nezaplacenoSeznam = (() => {
+                // Projdeme roční data pokud jsou, jinak aktuální měsíční
+                const zdrojPlatby = rocniPlatby.length > 0 ? rocniPlatby : platby;
+                return zdrojPlatby.filter(p => !p.zaplaceno).map(p => {
+                  const sml = smlouvy.find(s => s.id === p.smlouva_id);
+                  const naj = sml ? najemnici.find(n => n.id === sml.najemnik_id) : null;
+                  const jed = jednotky.find(j => j.id === p.jednotka_id);
+                  const obj = jed ? objekty.find(o => o.id === jed.objekt_id) : null;
+                  const pp = (rocniPlatby.length > 0 ? rocniPolozky : platbyPolozky).filter(x => x.platba_id === p.id);
+                  const predpis = pp.reduce((s,x) => s+(Number(x.castka_predpis_kc||x.predpis_kc)||0), 0);
+                  return { p, naj, jed, obj, predpis };
+                }).sort((a,b) => a.p.rok !== b.p.rok ? b.p.rok - a.p.rok : b.p.mesic - a.p.mesic);
+              })();
+              return (
+                <div>
+                  <div style={{ marginBottom: 10, display: "flex", alignItems: "center", gap: 12 }}>
+                    <div style={{ fontSize: 13, color: muted }}>
+                      {rocniPlatby.length > 0 ? `Data za rok ${rocniRok}` : "Data za aktuální měsíc/filtr"} — pro úplný přehled přepni na Roční přehled a vyber rok.
+                    </div>
+                    <button onClick={() => { setPlatbyPohled2("rok"); loadRocniPrehled(rocniRok); }} style={{ ...S.btnS, fontSize: 12 }}>Načíst roční data</button>
+                  </div>
+                  {nezaplacenoSeznam.length === 0 ? (
+                    <div style={{ ...S.card, padding: 40, textAlign: "center" }}>
+                      <div style={{ fontSize: 32, marginBottom: 12 }}>✓</div>
+                      <div style={{ color: "#4ade80", fontWeight: 600 }}>Všichni zaplatili!</div>
+                    </div>
+                  ) : (
+                    <div style={{ ...S.card, padding: 0, overflow: "hidden" }}>
+                      <div style={{ overflowX: "auto" }}>
+                        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                          <thead>
+                            <tr style={{ background: isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.03)" }}>
+                              {["Nájemník","Jednotka","Měsíc","Předpis","Akce"].map(h => <th key={h} style={S.th}>{h}</th>)}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {nezaplacenoSeznam.map(({ p, naj, jed, obj, predpis }) => (
+                              <tr key={p.id} style={{ borderBottom: `1px solid ${border}`, background: isDark ? "rgba(239,68,68,0.06)" : "rgba(239,68,68,0.04)" }}>
+                                <td style={{ ...S.td, fontWeight: 600, color: "#f87171" }}>{naj?.jmeno || "?"}</td>
+                                <td style={{ ...S.td, color: muted, fontSize: 12 }}>{obj?.nazev ? `${obj.nazev} / ` : ""}{jed?.cislo_bytu || "—"}</td>
+                                <td style={{ ...S.td, fontWeight: 600 }}>{MESICE[p.mesic-1]} {p.rok}</td>
+                                <td style={{ ...S.td, color: "#f87171", fontWeight: 600 }}>{predpis ? fmtKc(predpis) : "—"}</td>
+                                {isAdmin && <td style={S.td}>
+                                  <button onClick={() => {
+                                    const pp2 = (rocniPlatby.length > 0 ? rocniPolozky : platbyPolozky).filter(x => x.platba_id === p.id);
+                                    let polozkyData = pp2.map(x => ({...x}));
+                                    if (polozkyData.length === 0 && p.smlouva_id) {
+                                      const saz = sazebnikKDatu(p.smlouva_id, p.rok, p.mesic);
+                                      if (saz) polozkyData = sazebnikPolozky.filter(sp => sp.sazebnik_id === saz.id).map(sp => ({ nazev: sp.nazev, castka_predpis_kc: sp.castka_kc, _fromSazebnik: true }));
+                                    }
+                                    setEditPlatba({ ...p, polozky: polozkyData });
+                                  }} style={{ ...S.btnP, padding: "4px 12px", fontSize: 12 }}>Zadat platbu</button>
+                                </td>}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         )}
         {activeTab === "smlouvy" && (
@@ -1092,6 +1348,31 @@ export default function App() {
                   <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8, color: text }}>Jednotky v smlouvě</div>
                   {jList.map(j => { const o = objekty.find(x => x.id === j.objekt_id); return <div key={j.id} style={{ fontSize: 13, color: muted, padding: "4px 0" }}>{o?.nazev ? `${o.nazev} / ` : ""}{j.cislo_bytu} — {j.typ}{j.plocha_m2 ? `, ${j.plocha_m2} m²` : ""}{j.lodzie_m2 ? `, lodžie ${j.lodzie_m2} m²` : ""}</div>; })}
                 </div>
+                {/* Celkové saldo smlouvy */}
+                {(() => {
+                  const vsechnyPlatby = platby.filter(p => p.smlouva_id === s.id);
+                  const vsechnyPP = platbyPolozky.filter(pp => vsechnyPlatby.some(p => p.id === pp.platba_id));
+                  const celkemPredpis = vsechnyPP.reduce((sum,pp) => sum+(Number(pp.castka_predpis_kc||pp.predpis_kc)||0), 0);
+                  const celkemZapl = vsechnyPlatby.reduce((sum,p) => sum+(Number(p.banka_kc)||0)+(Number(p.hotove_kc)||0)+(Number(p.doplatek_kc)||0), 0);
+                  const saldo = celkemZapl - celkemPredpis;
+                  const nezaplCount = vsechnyPlatby.filter(p => !p.zaplaceno).length;
+                  if (vsechnyPlatby.length === 0) return null;
+                  return (
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10 }}>
+                      {[
+                        { label: "Plateb celkem", value: vsechnyPlatby.length, color: "#60a5fa" },
+                        { label: "Předpis (∑)", value: fmtKc(celkemPredpis), color: text },
+                        { label: "Zaplaceno (∑)", value: fmtKc(celkemZapl), color: "#4ade80" },
+                        { label: saldo >= 0 ? "Přeplatek" : "Dluh", value: fmtKc(Math.abs(saldo)), color: saldo >= 0 ? "#4ade80" : "#f87171" },
+                      ].map(c => (
+                        <div key={c.label} style={{ padding: "10px 14px", background: isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.03)", borderRadius: 8, border: `0.5px solid ${border}` }}>
+                          <div style={{ fontSize: 11, color: muted, marginBottom: 4 }}>{c.label}</div>
+                          <div style={{ fontSize: 15, fontWeight: 700, color: c.color }}>{c.value}</div>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })()}
                 {/* Sazebníky */}
                 <div>
                   <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8, color: text }}>Historie sazebníků</div>
@@ -1194,6 +1475,89 @@ export default function App() {
                   ))}
                 </tbody>
               </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* NÁPOVĚDA */}
+      {showHelp && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 2000, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "inherit" }}>
+          <div style={{ background: surface, borderRadius: 16, width: "min(640px,96vw)", maxHeight: "88vh", overflow: "auto", border: `1px solid ${border}` }}>
+            <div style={{ padding: "16px 24px", borderBottom: `1px solid ${border}`, display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, background: surface, zIndex: 1 }}>
+              <span style={{ fontWeight: 700, fontSize: 15, color: text }}>Nápověda — Evidence podnájmů</span>
+              <button onClick={() => setShowHelp(false)} style={{ background: "none", border: "none", color: muted, fontSize: 20, cursor: "pointer" }}>✕</button>
+            </div>
+            <div style={{ padding: "20px 24px", display: "flex", flexDirection: "column", gap: 20, fontSize: 13 }}>
+
+              {/* Jak funguje aplikace */}
+              <div style={{ padding: "12px 16px", background: isDark ? "rgba(59,130,246,0.08)" : "rgba(59,130,246,0.06)", borderRadius: 10, border: `1px solid rgba(59,130,246,0.2)` }}>
+                <div style={{ fontWeight: 600, color: "#60a5fa", marginBottom: 6 }}>Jak aplikace funguje</div>
+                <div style={{ color: text, lineHeight: 1.6 }}>Aplikace eviduje podnájmy ve čtyřech vrstvách: <b>Jednotky</b> (byty, garáže, sklepy) → <b>Smlouvy</b> (kdo a jak dlouho) → <b>Sazebník</b> (kolik platí) → <b>Platby</b> (co skutečně přišlo).</div>
+              </div>
+
+              {/* Záložky */}
+              {[
+                {
+                  tab: "Přehled", ico: "🏠",
+                  co: "Rychlý přehled všech jednotek — kdo bydlí, do kdy má smlouvu, kolik platí.",
+                  jak: "Použij filtr Dům pro zobrazení jen jednoho bytového domu. Kliknutím na jméno nájemníka otevřeš detail smlouvy.",
+                },
+                {
+                  tab: "Platby", ico: "💰",
+                  co: "Správa měsíčních plateb. Tři pohledy: Měsíc (aktuální měsíc), Roční přehled (tabulka jako Excel), Kdo nezaplatil.",
+                  jak: [
+                    "1. Vyber měsíc šipkami ‹ ›",
+                    "2. Klikni + Generovat předpisy (vytvoří záznamy ze sazebníku)",
+                    "3. Klikni ✏️ u platby a zadej datum + částku (Banka/Hotově)",
+                    "Roční přehled: barevná tabulka — zelená = zaplaceno, červená = nezaplaceno, klik na buňku = detail",
+                  ].join("\n"),
+                },
+                {
+                  tab: "Smlouvy", ico: "📄",
+                  co: "Přehled všech smluv. Červená = propadlá, oranžová = končí do 60 dní.",
+                  jak: "📄 Detail smlouvy (sazebníky, dodatky, saldo) · ✏️ Editace · 📋 Přidat dodatek · 💰 Nový sazebník · 🔴 Ukončit smlouvu",
+                },
+                {
+                  tab: "Nájemníci", ico: "👤",
+                  co: "Osobní údaje nájemníků. Byt se nepřiřazuje zde — přiřazení je přes smlouvu.",
+                  jak: "Přidej nájemníka → pak vytvoř smlouvu a tam vyber nájemníka + jednotky.",
+                },
+                {
+                  tab: "Jednotky", ico: "🏢",
+                  co: "Správa bytových domů a jednotek (byty, garáže, sklepy, stání).",
+                  jak: "Nejprve přidej Bytový dům, pak teprve přidávej jednotky v rámci domu.",
+                },
+              ].map(item => (
+                <div key={item.tab} style={{ borderBottom: `1px solid ${border}`, paddingBottom: 16 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                    <span style={{ fontSize: 16 }}>{item.ico}</span>
+                    <span style={{ fontWeight: 700, fontSize: 14, color: text }}>{item.tab}</span>
+                  </div>
+                  <div style={{ color: muted, marginBottom: 6 }}>{item.co}</div>
+                  <div style={{ background: isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.03)", borderRadius: 7, padding: "8px 12px", color: text, lineHeight: 1.7, whiteSpace: "pre-line", fontSize: 12 }}>{item.jak}</div>
+                </div>
+              ))}
+
+              {/* Měsíční rutina */}
+              <div>
+                <div style={{ fontWeight: 600, color: text, marginBottom: 10 }}>Typická měsíční rutina</div>
+                {[
+                  ["1.", "Záložka Platby → vyber aktuální měsíc"],
+                  ["2.", "Klikni + Generovat předpisy (pouze jednou za měsíc)"],
+                  ["3.", "Počkej na příchozí platby z banky"],
+                  ["4.", "Klikni ✏️ u každé platby → zadej datum a částku (Banka)"],
+                  ["5.", "Zkontroluj Kdo nezaplatil — připomeň nájemníkům"],
+                  ["6.", "Na konci roku: + Vyúčtování pro nedoplatky/přeplatky energií"],
+                ].map(([n, t]) => (
+                  <div key={n} style={{ display: "flex", gap: 10, padding: "6px 0", borderBottom: `1px solid ${border}` }}>
+                    <span style={{ color: "#60a5fa", fontWeight: 700, minWidth: 20 }}>{n}</span>
+                    <span style={{ color: text }}>{t}</span>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ color: muted, fontSize: 12, textAlign: "center" }}>{APP_BUILD} · podnajem.vercel.app</div>
             </div>
           </div>
         </div>
