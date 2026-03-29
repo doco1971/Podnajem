@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from "react";
 import * as XLSX from "xlsx";
-// BUILD: 2026_03_28_build0005
+// BUILD: 2026_03_29_build0006
 // ============================================================
 // PRAVIDLO #0 — PŘED KAŽDÝM ROZŠÍŘENÍM: průzkum → výběr → implementace
 // PRAVIDLO #1 — NEFUNGUJE: zkontroluj kód. NEHÁDEJ.
@@ -43,12 +43,15 @@ import * as XLSX from "xlsx";
 // BUILD0003 — Flexibilní položky zálohy, pohled období, upozornění smluv
 // BUILD0004 — Přepracovaná architektura: jednotky, smlouvy, sazebník, dodatky
 //             Formát datumů dd.mm.yyyy, type=date všude
-// BUILD0005 — FIX refresh plateb po generování, platební formulář automaticky
-//             načte položky ze sazebníku, správná struktura platby (příjem/odečet/info),
-//             roční vyúčtování (formulář + detail smlouvy), úhrady jako variabilní pole
+// BUILD0005 — FIX refresh plateb, automatické načtení sazebníku, roční vyúčtování
+// BUILD0006 — FIX: chyba "invalid input syntax bigint undefined" při uložení platby
+//             (položky ze sazebníku nemají id → PATCH na undefined → error)
+//             FIX: platby_polozky INSERT místo PATCH pro nové položky ze sazebníku
+//             FIX: saveVyuctovani guard pro undefined smlouva_id
+//             FIX: castka_skutecnost_kc sloupec neexistuje → odstraněn z INSERT
 //
 // ============================================================
-const APP_BUILD = "build0005";
+const APP_BUILD = "build0006";
 const SB_URL = import.meta.env.VITE_SB_URL;
 const SB_KEY = import.meta.env.VITE_SB_KEY;
 const MESICE = ["Leden","Únor","Březen","Duben","Květen","Červen","Červenec","Srpen","Září","Říjen","Listopad","Prosinec"];
@@ -513,7 +516,7 @@ export default function App() {
         if (saz) {
           const polozky = sazebnikPolozky.filter(sp => sp.sazebnik_id === saz.id);
           if (polozky.length > 0) {
-            const ppRows = polozky.map(sp => ({ platba_id: novaPlatba.id, nazev: sp.nazev, castka_predpis_kc: sp.castka_kc, castka_skutecnost_kc: null }));
+            const ppRows = polozky.map(sp => ({ platba_id: novaPlatba.id, nazev: sp.nazev, castka_predpis_kc: sp.castka_kc }));
             await sb("platby_polozky", { method: "POST", body: JSON.stringify(ppRows), prefer: "return=minimal" });
           }
         }
@@ -537,9 +540,26 @@ export default function App() {
         zaplaceno: (Number(data.banka_kc) || 0) + (Number(data.hotove_kc) || 0) + (Number(data.doplatek_kc) || 0) > 0,
       };
       await sb(`platby?id=eq.${data.id}`, { method: "PATCH", body: JSON.stringify(payload), prefer: "return=minimal" });
-      if (data.polozky) {
-        for (const pp of data.polozky) {
-          await sb(`platby_polozky?id=eq.${pp.id}`, { method: "PATCH", body: JSON.stringify({ castka_predpis_kc: Number(pp.castka_predpis_kc) || 0 }), prefer: "return=minimal" });
+      if (data.polozky && data.polozky.length > 0) {
+        // Rozděl položky na existující (mají id) a nové (ze sazebníku, nemají id)
+        const existujici = data.polozky.filter(pp => pp.id && !pp._fromSazebnik);
+        const nove = data.polozky.filter(pp => !pp.id || pp._fromSazebnik);
+        // PATCH existující
+        for (const pp of existujici) {
+          await sb(`platby_polozky?id=eq.${pp.id}`, {
+            method: "PATCH",
+            body: JSON.stringify({ castka_predpis_kc: Number(pp.castka_predpis_kc) || 0 }),
+            prefer: "return=minimal"
+          });
+        }
+        // INSERT nové (ze sazebníku)
+        if (nove.length > 0) {
+          const rows = nove.map(pp => ({
+            platba_id: data.id,
+            nazev: pp.nazev,
+            castka_predpis_kc: Number(pp.castka_predpis_kc) || 0,
+          }));
+          await sb("platby_polozky", { method: "POST", body: JSON.stringify(rows), prefer: "return=minimal" });
         }
       }
       showMsg("Platba uložena"); await logAkce(userName, "Editace platby", `ID: ${data.id}`);
@@ -557,6 +577,7 @@ export default function App() {
   // ── CRUD — Vyúčtování ─────────────────────────────────────
   const saveVyuctovani = async (data) => {
     try {
+      if (!data.smlouva_id) { showMsg("Vyberte smlouvu.", "err"); return; }
       const payload = {
         smlouva_id: Number(data.smlouva_id),
         datum: toISO(data.datum),
@@ -564,7 +585,7 @@ export default function App() {
         castka_kc: Number(data.castka_kc) || 0,
         popis: data.popis || "",
         uhrazeno: data.uhrazeno || false,
-        datum_uhrazeni: data.uhrazeno ? toISO(data.datum_uhrazeni) || null : null,
+        datum_uhrazeni: data.uhrazeno && data.datum_uhrazeni ? toISO(data.datum_uhrazeni) : null,
       };
       if (data.id) {
         await sb(`vyuctovani?id=eq.${data.id}`, { method: "PATCH", body: JSON.stringify(payload), prefer: "return=minimal" });
